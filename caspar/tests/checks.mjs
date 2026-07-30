@@ -250,44 +250,21 @@ await check("an agent's own API key takes over the run from the image's credenti
   assert.equal(inherited.model, undefined);
 });
 
-await check("a non-Anthropic provider is gateway-routed when configured, and reported when not", () => {
-  // davinci spoke gemini/openai/grok natively; Claude Code speaks the Anthropic
-  // API, so those providers are served through a gateway the operator configures.
-  const routed = {};
-  const viaGateway = applyLlmOverride(
-    { ...routed, CLAUDE_CREATURE_LLM_GATEWAY_GEMINI: "https://gw.internal/anthropic", ANTHROPIC_API_KEY: "sk-platform" },
-    { provider: "gemini", models: ["gemini-3-pro"], api_key: "agent-gemini-key" },
-  );
-  assert.equal(viaGateway.model, "gemini-3-pro");
-  assert.match(viaGateway.warning, /gateway/);
-
-  const env = { CLAUDE_CREATURE_LLM_GATEWAY_GEMINI: "https://gw.internal/anthropic", ANTHROPIC_API_KEY: "sk-platform" };
-  applyLlmOverride(env, { provider: "gemini", api_key: "agent-gemini-key" });
-  assert.equal(env.ANTHROPIC_BASE_URL, "https://gw.internal/anthropic");
-  assert.equal(env.ANTHROPIC_AUTH_TOKEN, "agent-gemini-key");
-  assert.equal(env.ANTHROPIC_API_KEY, undefined, "the platform's key must not leak to a third-party gateway");
-
-  // With nothing configured the run still happens, and says what it fell back to.
-  const unconfigured = {};
-  const res = applyLlmOverride(unconfigured, { provider: "gemini", api_key: "k" });
-  assert.match(res.warning, /no gateway is configured/);
-  assert.equal(unconfigured.ANTHROPIC_BASE_URL, undefined);
-});
-
 await check("a per-agent LLM override lands in the child environment", () => {
   const anthropic = buildChildEnv({ env: { PATH: "/usr/bin", CLAUDE_CODE_SESSION_ID: "leaked" }, llm: { provider: "anthropic", models: ["claude-opus-5"], api_key: "sk-test-key" } });
   assert.equal(anthropic.env.ANTHROPIC_API_KEY, "sk-test-key");
   assert.equal(anthropic.model, "claude-opus-5");
   assert.equal(anthropic.env.CLAUDE_CODE_SESSION_ID, undefined, "the parent's session id must not leak into the child");
   assert.equal(anthropic.env.CLAUDE_CODE_ENTRYPOINT, "caspar-creature");
+  assert.equal(anthropic.proxy, undefined, "the native provider needs no translation proxy");
 
-  // An agent may name its own gateway directly, instead of relying on one the
-  // operator configured for the provider.
-  const gateway = {};
-  const { warning } = applyLlmOverride(gateway, { provider: "openrouter", api_key: "k", base_url: "https://gw.example/v1" });
-  assert.equal(gateway.ANTHROPIC_BASE_URL, "https://gw.example/v1");
-  assert.equal(gateway.ANTHROPIC_AUTH_TOKEN, "k");
-  assert.match(warning, /gateway https:\/\/gw\.example\/v1/);
+  // openai/gemini/xai/openrouter routing (through the built-in translation proxy)
+  // and an unknown provider's gateway fallback are covered in llm-checks.mjs. Here
+  // just confirm a known non-native provider selects the proxy, not the env.
+  const openai = buildChildEnv({ env: { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-platform" }, llm: { provider: "openai", models: ["gpt-4o"], api_key: "agent-key" } });
+  assert.ok(openai.proxy, "a non-native provider routes to the proxy");
+  assert.equal(openai.proxy.provider.id, "openai");
+  assert.equal(openai.env.ANTHROPIC_API_KEY, "sk-caspar-local-proxy", "the agent's real key stays out of the child env");
 });
 
 await check("trajectory events land on the channels the client renders", () => {

@@ -194,6 +194,52 @@ Runtime knobs (baked at deploy time or set on the entity):
 
 ---
 
+## LLM providers (per agent)
+
+Decillion stores an optional `{provider, model, apiKey}` per agent and sends it as
+`config.llm` with every prompt — the same block davinci consumed. Every part is
+honoured:
+
+| Provider (`llm_provider`) | How it's served | `llm_model` example |
+|---|---|---|
+| `anthropic` (or unset) | The Anthropic API directly | `claude-opus-5` |
+| `openai` | Built-in Anthropic↔OpenAI **translation proxy** | `gpt-4o` |
+| `gemini` (`google`) | Translation proxy (Gemini's OpenAI-compatible endpoint) | `gemini-2.5-pro` |
+| `xai` (`grok`) | Translation proxy | `grok-2-latest` |
+| `openrouter` | Translation proxy | `anthropic/claude-3.5-sonnet`, `openai/gpt-4o`, … |
+| `bedrock` / `vertex` | 3P backbone (the image's cloud creds) | provider model id |
+
+Claude Code speaks the **Anthropic Messages API**, so `anthropic` is native. The
+four OpenAI-compatible providers are served through a tiny proxy the creature
+starts on localhost for the run (`caspar/llm/`): the CLI talks Anthropic to the
+proxy, the proxy translates each request — tools, tool results, images, streaming
+SSE — to OpenAI Chat Completions, calls the provider **with the agent's own key**,
+and translates the answer back. So an agent works on any of these from just
+`provider` + `model` + `api_key`, with nothing for the operator to configure.
+
+- **The agent's key takes over the run.** When `config.llm` carries an `api_key`,
+  every credential the image baked in is removed for that run — the agent's
+  provider is billed, never the platform's. The real key lives only in the proxy
+  process; the CLI is given a placeholder Anthropic key.
+- **The agent's key never leaves the creature.** It goes only to the provider the
+  agent named (agents cannot set the provider host beyond an optional `base_url`).
+- **Base URL overrides.** An agent may set `llm.base_url` (e.g. an Azure/OpenAI
+  gateway); an operator may repoint a provider with `CLAUDE_CREATURE_LLM_BASE_<PROVIDER>`.
+- **Unknown provider.** With no `api_key` (nothing to auth with) or an unrecognised
+  provider and no gateway, the run falls back to the image's default backbone and
+  says so in the reply's `warnings` — never a silent wrong answer.
+- **Usage/billing.** `completion_tokens` from the provider is exact;
+  `prompt_tokens` for a streamed run is a proxy estimate (providers report input
+  tokens only at the end of a stream), so Decillion's per-prompt billing stays
+  close.
+
+`node caspar/tests/llm-checks.mjs` checks the translator + proxy end-to-end against
+a fake OpenAI server; `node caspar/tests/live-provider.mjs` runs the **real** CLI
+through the proxy on a fake provider, proving an agentic tool-using turn completes
+on a non-Anthropic backbone.
+
+---
+
 ## Testing
 
 ```bash

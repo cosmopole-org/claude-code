@@ -26,7 +26,9 @@
     "caspar:serve": "node caspar/runtime.mjs",
     "check:caspar": "node caspar/tests/checks.mjs",
     "check:caspar:cli": "node caspar/tests/live-cli.mjs",
-    "check:caspar:container": "node caspar/tests/container-check.mjs"
+    "check:caspar:container": "node caspar/tests/container-check.mjs",
+    "check:caspar:llm": "node caspar/tests/llm-checks.mjs",
+    "check:caspar:provider": "node caspar/tests/live-provider.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

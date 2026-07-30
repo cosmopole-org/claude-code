@@ -24,6 +24,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { startLlmProxy } from "./llm/llmProxy.mjs";
+import { proxiedProviderIds, resolveProvider } from "./llm/providers.mjs";
+
 /** Env vars that would leak *this* process's session identity into the child. */
 const STRIPPED_ENV = [
   "CLAUDE_CODE_SESSION_ID",
@@ -97,6 +100,9 @@ function gatewayEnvName(provider) {
   return `CLAUDE_CREATURE_LLM_GATEWAY_${provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
 }
 
+/** A placeholder Anthropic key set when the run is served through the local proxy. */
+const PROXY_PLACEHOLDER_KEY = "sk-caspar-local-proxy";
+
 /**
  * Translate a per-agent LLM override into child env + model selection.
  *
@@ -107,22 +113,32 @@ function gatewayEnvName(provider) {
  *   • `api_key`  → the run authenticates as that key, and every other credential
  *                  the image carries is removed for this run;
  *   • `models[0]`→ `--model` for the run;
- *   • `provider` → the Anthropic API (default), Bedrock, Vertex, or an
- *                  Anthropic-compatible gateway.
+ *   • `provider` → routed to the right backbone:
+ *       - anthropic (default)      → the Anthropic API directly;
+ *       - bedrock / vertex         → the 3P backbone (its own creds);
+ *       - openai / gemini / xai /
+ *         openrouter               → the creature's built-in Anthropic↔OpenAI
+ *                                     translation proxy, so these providers work
+ *                                     from just provider+model+api_key;
+ *       - anything else with a
+ *         configured gateway       → that Anthropic-compatible gateway.
  *
- * A provider Claude Code cannot speak natively (gemini, openai, grok — davinci had
- * its own client per provider) is routable through a gateway the operator
- * configures: `CLAUDE_CREATURE_LLM_GATEWAY_<PROVIDER>` (or the agent's own
- * `base_url`, or a catch-all `CLAUDE_CREATURE_LLM_GATEWAY`). With no gateway
- * configured the run proceeds on the image's default backbone and says so — in the
- * VM log and in the reply's `warnings` — instead of failing or pretending.
+ * A known non-native provider with no `api_key` (nothing to authenticate with), or
+ * an unknown provider with no gateway, falls back to the image's default backbone
+ * and says so in the VM log and the reply's `warnings` — never failing silently.
+ *
+ * When the built-in proxy is chosen this returns a `proxy` descriptor; the caller
+ * starts the proxy and points `ANTHROPIC_BASE_URL` at it. The agent's real
+ * provider key never enters the CLI's environment (the CLI gets a placeholder).
  */
 export function applyLlmOverride(env, llm) {
-  if (!llm || typeof llm !== "object") return { model: undefined, warning: undefined, provider: undefined, credential: undefined };
+  const none = { model: undefined, warning: undefined, provider: undefined, credential: undefined, proxy: undefined };
+  if (!llm || typeof llm !== "object") return none;
   const provider = String(llm.provider || "").trim().toLowerCase();
   const model = (Array.isArray(llm.models) && llm.models.find((m) => typeof m === "string" && m.trim())) || (typeof llm.model === "string" ? llm.model : undefined);
   const apiKey = (typeof llm.api_key === "string" && llm.api_key.trim()) || (typeof llm.apiKey === "string" && llm.apiKey.trim()) || "";
   const baseUrl = (typeof llm.base_url === "string" && llm.base_url.trim()) || (typeof llm.baseUrl === "string" && llm.baseUrl.trim()) || "";
+  const modelId = model && model.trim() ? model.trim() : undefined;
 
   /** Drop every credential the image baked in, so only the agent's own is used. */
   const takeOver = () => {
@@ -131,7 +147,10 @@ export function applyLlmOverride(env, llm) {
 
   let warning;
   let credential;
-  if (NATIVE_PROVIDERS.has(provider)) {
+  let proxy;
+
+  const resolved = resolveProvider(provider, { env, baseUrlOverride: baseUrl });
+  if (NATIVE_PROVIDERS.has(provider) || (resolved && resolved.native)) {
     if (apiKey) {
       takeOver();
       env.ANTHROPIC_API_KEY = apiKey;
@@ -150,13 +169,28 @@ export function applyLlmOverride(env, llm) {
     env.CLAUDE_CODE_USE_VERTEX = "1";
     delete env.CLAUDE_CODE_USE_BEDROCK;
     credential = "image:vertex";
+  } else if (resolved) {
+    // A known OpenAI-compatible provider: serve it through the built-in proxy.
+    if (apiKey) {
+      takeOver();
+      // The CLI needs *some* Anthropic key to enable API-key auth; the real
+      // provider key stays in the proxy process, never in the child env.
+      env.ANTHROPIC_API_KEY = PROXY_PLACEHOLDER_KEY;
+      delete env.CLAUDE_CODE_USE_BEDROCK;
+      delete env.CLAUDE_CODE_USE_VERTEX;
+      proxy = { provider: resolved, apiKey, model: modelId };
+      credential = `agent:${resolved.id}`;
+    } else {
+      warning =
+        `LLM provider "${resolved.id}" was selected but the agent carries no api_key — ` +
+        `this run used the creature's default backbone instead.`;
+    }
   } else {
+    // Unknown provider: honour an operator-configured Anthropic-compatible gateway.
     const gateway = baseUrl || (env[gatewayEnvName(provider)] || "").trim() || (env.CLAUDE_CREATURE_LLM_GATEWAY || "").trim();
     if (gateway) {
       takeOver();
       env.ANTHROPIC_BASE_URL = gateway;
-      // A gateway authenticates with a bearer token; the CLI sends
-      // ANTHROPIC_AUTH_TOKEN as `Authorization: Bearer …`.
       if (apiKey) env.ANTHROPIC_AUTH_TOKEN = apiKey;
       delete env.CLAUDE_CODE_USE_BEDROCK;
       delete env.CLAUDE_CODE_USE_VERTEX;
@@ -164,12 +198,11 @@ export function applyLlmOverride(env, llm) {
       warning = `LLM provider "${provider}" is served through the Anthropic-compatible gateway ${gateway}`;
     } else {
       warning =
-        `LLM provider "${provider}" is not an Anthropic-compatible backbone, and no gateway is configured ` +
-        `for it (${gatewayEnvName(provider)} or CLAUDE_CREATURE_LLM_GATEWAY) — this run used the creature's ` +
-        `default backbone instead of the agent's provider`;
+        `LLM provider "${provider}" is not a supported backbone (${["anthropic", ...proxiedProviderIds(), "bedrock", "vertex"].join(", ")}) ` +
+        `and no gateway is configured for it — this run used the creature's default backbone.`;
     }
   }
-  return { model: model && model.trim() ? model.trim() : undefined, warning, provider: provider || "anthropic", credential };
+  return { model: modelId, warning, provider: provider || "anthropic", credential, proxy };
 }
 
 /** Build the child environment: inherited, scrubbed, then per-run overrides. */
@@ -184,9 +217,9 @@ export function buildChildEnv({ env = process.env, llm, configDir, home, extra =
   childEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = childEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || "1";
   if (configDir) childEnv.CLAUDE_CONFIG_DIR = configDir;
   if (home) childEnv.HOME = home;
-  const { model, warning, provider, credential } = applyLlmOverride(childEnv, llm);
+  const { model, warning, provider, credential, proxy } = applyLlmOverride(childEnv, llm);
   Object.assign(childEnv, extra);
-  return { env: childEnv, model, warning, provider, credential };
+  return { env: childEnv, model, warning, provider, credential, proxy };
 }
 
 /** How this run will authenticate, for the boot log. Never the credential itself. */
@@ -245,16 +278,38 @@ export async function runClaude(opts) {
   }
 
   const configDir = (env.CLAUDE_CREATURE_CONFIG_DIR || "").trim() || undefined;
-  const { env: childEnv, model: llmModel, warning, provider, credential } = buildChildEnv({
+  const { env: childEnv, model: llmModel, warning, provider, credential, proxy } = buildChildEnv({
     env,
     llm,
     configDir,
     home: drop ? drop.home : undefined,
   });
   if (warning) warnings.push(warning);
+
+  // A non-Anthropic provider (openai/gemini/xai/openrouter) is served through the
+  // built-in Anthropic↔OpenAI translation proxy: start it and point the CLI at it.
+  // The agent's real provider key lives only in the proxy process.
+  let llmProxy = null;
+  if (proxy) {
+    try {
+      llmProxy = await startLlmProxy(proxy.provider, proxy.apiKey, {
+        onError: (err) => onStderr?.(`[caspar-llm-proxy] ${err?.message || err}\n`),
+      });
+      childEnv.ANTHROPIC_BASE_URL = llmProxy.baseUrl;
+    } catch (err) {
+      warnings.push(`could not start the ${proxy.provider.id} translation proxy (${err?.message || err}); used the default backbone`);
+      llmProxy = null;
+    }
+  }
+
   // What this run will authenticate as — reported so an operator can tell an
   // agent's own key from the image's, without either ever being logged.
-  const backbone = { provider, credential: credential || credentialSource(childEnv), auth: credentialSource(childEnv) };
+  const backbone = {
+    provider,
+    credential: credential || credentialSource(childEnv),
+    auth: credentialSource(childEnv),
+    ...(llmProxy ? { proxied: proxy.provider.id, proxyModel: proxy.model } : {}),
+  };
 
   const { command, prefixArgs } = resolveCli(env);
   const args = [...prefixArgs, "--print", "--output-format", "stream-json", "--verbose", "--permission-mode", mode];
@@ -361,6 +416,13 @@ export async function runClaude(opts) {
 
   const outcome = await Promise.race([exited, spawnFailure]);
   clearTimeout(killTimer);
+  if (llmProxy) {
+    try {
+      await llmProxy.stop();
+    } catch {
+      /* best effort */
+    }
+  }
   if (outcome instanceof Error) {
     return { result: null, messages, exitCode: null, timedOut, stderr: `${outcome.message}\n${stderr}`, argv: [command, ...args], warnings, stdoutTail, backbone };
   }
