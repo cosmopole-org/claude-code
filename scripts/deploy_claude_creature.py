@@ -235,8 +235,11 @@ def compose_dockerfile(files: Dict[str, str]) -> Tuple[bytes, str]:
         # Report the names only — a key must never reach a log.
         info(f"baking backbone credentials/knobs into the image: {', '.join(sorted(baked))}")
     else:
-        warn("no Anthropic credentials in this environment — the deployed agent will not be able to "
-             "reach a model (set ANTHROPIC_API_KEY, or CLAUDE_CODE_OAUTH_TOKEN, before deploying)")
+        info("no default backbone credentials baked into the image. This is fine when every agent "
+             "brings its own LLM provider + key (config.llm: openai/gemini/xai/openrouter) — those "
+             "runs go through the creature's built-in translation proxy and never need an Anthropic "
+             "key. Only agents with NO per-agent LLM override need a default backbone here "
+             "(ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN, or bedrock/vertex).")
     dockerfile = dockerfile + b"\n" + bake_snippet(baked).encode()
     return stamp_context(dockerfile, files)
 
