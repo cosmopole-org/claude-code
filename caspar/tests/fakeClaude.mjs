@@ -72,12 +72,21 @@ if (scenario.hang) {
   await new Promise((resolve) => setTimeout(resolve, 3_600_000));
 }
 
-for (const message of scenario.messages || []) {
+const messages = scenario.messages || [];
+for (let i = 0; i < messages.length; i++) {
+  const message = messages[i];
   if (message.__sleepMs) {
     await new Promise((resolve) => setTimeout(resolve, message.__sleepMs));
     continue;
   }
-  emit(message);
+  // `noFinalNewline` drops the trailing newline on the LAST message, mimicking a
+  // CLI whose terminal `result` line is truncated at exit — the bridge must still
+  // parse it (flush-on-close) instead of losing the run's answer.
+  if (scenario.noFinalNewline && i === messages.length - 1) {
+    process.stdout.write(JSON.stringify(message));
+  } else {
+    emit(message);
+  }
 }
 
 process.exit(scenario.exitCode ?? 0);

@@ -363,32 +363,35 @@ export async function runClaude(opts) {
   }, Math.max(1, maxWallSeconds) * 1000);
 
   let buffer = "";
+  const processLine = (raw) => {
+    const line = raw.trim();
+    if (!line) return;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      // Non-JSON noise on stdout (a warning from a wrapper, say) — keep a tail
+      // for diagnostics, never fail the run over it.
+      stdoutTail = `${stdoutTail}${line}\n`.slice(-2000);
+      return;
+    }
+    messages.push(message);
+    if (message?.type === "result") result = message;
+    if (onMessage) {
+      try {
+        onMessage(message);
+      } catch {
+        /* a listener must not break the run */
+      }
+    }
+  };
   child.stdout.setEncoding("utf-8");
   child.stdout.on("data", (chunk) => {
     buffer += chunk;
     let index;
     while ((index = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, index).trim();
+      processLine(buffer.slice(0, index));
       buffer = buffer.slice(index + 1);
-      if (!line) continue;
-      let message;
-      try {
-        message = JSON.parse(line);
-      } catch {
-        // Non-JSON noise on stdout (a warning from a wrapper, say) — keep a tail
-        // for diagnostics, never fail the run over it.
-        stdoutTail = `${stdoutTail}${line}\n`.slice(-2000);
-        continue;
-      }
-      messages.push(message);
-      if (message?.type === "result") result = message;
-      if (onMessage) {
-        try {
-          onMessage(message);
-        } catch {
-          /* a listener must not break the run */
-        }
-      }
     }
   });
 
@@ -416,6 +419,13 @@ export async function runClaude(opts) {
 
   const outcome = await Promise.race([exited, spawnFailure]);
   clearTimeout(killTimer);
+  // The child has closed and every stdout chunk has been delivered: flush any
+  // final line the CLI emitted WITHOUT a trailing newline. A `type:"result"`
+  // that arrives unterminated — a run SIGTERM'd mid-line, or stdout truncated as
+  // the process exits — would otherwise sit unparsed in `buffer` and be dropped,
+  // turning a run that actually answered into a "produced no result" failure.
+  if (buffer.trim()) processLine(buffer);
+  buffer = "";
   if (llmProxy) {
     try {
       await llmProxy.stop();

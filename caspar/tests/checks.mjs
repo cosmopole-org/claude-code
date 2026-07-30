@@ -615,6 +615,33 @@ await check("a CLI that produces no result still answers", async () => {
   assert.equal(signals.filter((s) => s.packet.kind === "davinci/result").length, 1);
 });
 
+await check("a clean exit whose terminal result line never arrives recovers the assistant's answer", async () => {
+  // The CLI exits 0 having spoken, but no `type:"result"` line reaches the bridge
+  // (the exact shape of the 'produced no result (exit code 0)' failure). Because
+  // the run actually answered, the reply is that answer — not a failure.
+  const { result, signals } = await serveWithFakeCli({
+    scenario: {
+      exitCode: 0,
+      messages: [
+        { type: "system", subtype: "init", session_id: "sess-1", model: "claude-opus-5", tools: [], mcp_servers: [] },
+        { type: "assistant", message: { content: [{ type: "text", text: "Hi! How can I help you today?" }] }, session_id: "sess-1" },
+      ],
+    },
+  });
+  assert.equal(result.success, true, "a run that spoke but lost its result line is not a failure");
+  assert.equal(result.answer, "Hi! How can I help you today?");
+  assert.ok(Array.isArray(result.warnings) && result.warnings.some((w) => /terminal result line/.test(w)), "the recovery is surfaced as a warning");
+  assert.equal(signals.filter((s) => s.packet.kind === "davinci/result").length, 1);
+});
+
+await check("a result line emitted without a trailing newline is still parsed (flush on close)", async () => {
+  // The terminal `result` arrives unterminated (process truncated at exit). The
+  // bridge must flush its buffer on close and read it, not drop the whole run.
+  const { result } = await serveWithFakeCli({ scenario: { ...successScenario("The deploy is green."), noFinalNewline: true } });
+  assert.equal(result.success, true, "the unterminated result line must still be captured");
+  assert.equal(result.answer, "The deploy is green.");
+});
+
 await check("a run that never finishes is ended by its wall-clock budget", async () => {
   const { result, signals } = await serveWithFakeCli({ scenario: { hang: true }, envOverrides: { CLAUDE_CREATURE_MAX_WALL_SECONDS: "2" } });
   assert.equal(result.success, false);
