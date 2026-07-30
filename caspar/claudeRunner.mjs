@@ -82,39 +82,94 @@ export function dropTarget({ env = process.env, uid = typeof process.getuid === 
 }
 
 /**
- * Translate the platform's per-agent LLM override (`config.llm`:
- * `{provider, models, api_key}`) into child env + model selection.
+ * Every credential the CLI can authenticate with. When an agent brings its own,
+ * the others must go: the CLI prefers `ANTHROPIC_AUTH_TOKEN`, then an OAuth token,
+ * so leaving the image's baked credential in place would quietly bill the
+ * platform's account for a run the agent's own key was supposed to pay for.
+ */
+const CREDENTIAL_ENV = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"];
+
+/** Providers that are the Anthropic API itself. */
+const NATIVE_PROVIDERS = new Set(["", "anthropic", "claude", "claude-code", "claude_code"]);
+
+/** `openrouter` → `CLAUDE_CREATURE_LLM_GATEWAY_OPENROUTER`. */
+function gatewayEnvName(provider) {
+  return `CLAUDE_CREATURE_LLM_GATEWAY_${provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
+}
+
+/**
+ * Translate a per-agent LLM override into child env + model selection.
  *
- * Anthropic (the native backbone) and Anthropic-compatible gateways are honoured;
- * a provider this CLI cannot speak is reported back rather than silently ignored,
- * so an operator can see why an agent is answering on the image default.
+ * Decillion stores an optional `{provider, model, apiKey}` per agent and sends it
+ * as `config.llm` = `{provider, models:[model], api_key}` with every prompt — the
+ * same block davinci read. All three parts are honoured here:
+ *
+ *   • `api_key`  → the run authenticates as that key, and every other credential
+ *                  the image carries is removed for this run;
+ *   • `models[0]`→ `--model` for the run;
+ *   • `provider` → the Anthropic API (default), Bedrock, Vertex, or an
+ *                  Anthropic-compatible gateway.
+ *
+ * A provider Claude Code cannot speak natively (gemini, openai, grok — davinci had
+ * its own client per provider) is routable through a gateway the operator
+ * configures: `CLAUDE_CREATURE_LLM_GATEWAY_<PROVIDER>` (or the agent's own
+ * `base_url`, or a catch-all `CLAUDE_CREATURE_LLM_GATEWAY`). With no gateway
+ * configured the run proceeds on the image's default backbone and says so — in the
+ * VM log and in the reply's `warnings` — instead of failing or pretending.
  */
 export function applyLlmOverride(env, llm) {
-  if (!llm || typeof llm !== "object") return { model: undefined, warning: undefined };
+  if (!llm || typeof llm !== "object") return { model: undefined, warning: undefined, provider: undefined, credential: undefined };
   const provider = String(llm.provider || "").trim().toLowerCase();
   const model = (Array.isArray(llm.models) && llm.models.find((m) => typeof m === "string" && m.trim())) || (typeof llm.model === "string" ? llm.model : undefined);
-  const apiKey = typeof llm.api_key === "string" && llm.api_key.trim() ? llm.api_key.trim() : typeof llm.apiKey === "string" ? llm.apiKey.trim() : "";
-  const baseUrl = typeof llm.base_url === "string" ? llm.base_url.trim() : typeof llm.baseUrl === "string" ? llm.baseUrl.trim() : "";
+  const apiKey = (typeof llm.api_key === "string" && llm.api_key.trim()) || (typeof llm.apiKey === "string" && llm.apiKey.trim()) || "";
+  const baseUrl = (typeof llm.base_url === "string" && llm.base_url.trim()) || (typeof llm.baseUrl === "string" && llm.baseUrl.trim()) || "";
+
+  /** Drop every credential the image baked in, so only the agent's own is used. */
+  const takeOver = () => {
+    for (const key of CREDENTIAL_ENV) delete env[key];
+  };
 
   let warning;
-  if (!provider || provider === "anthropic" || provider === "claude" || provider === "claude-code") {
+  let credential;
+  if (NATIVE_PROVIDERS.has(provider)) {
     if (apiKey) {
+      takeOver();
       env.ANTHROPIC_API_KEY = apiKey;
-      delete env.ANTHROPIC_AUTH_TOKEN; // an explicit key must win over a baked token
+      // An explicit Anthropic key means the direct API, never a 3P backbone the
+      // image may have been built for.
+      delete env.CLAUDE_CODE_USE_BEDROCK;
+      delete env.CLAUDE_CODE_USE_VERTEX;
+      credential = "agent:ANTHROPIC_API_KEY";
     }
-  } else if (provider === "bedrock") {
+    if (baseUrl) env.ANTHROPIC_BASE_URL = baseUrl;
+  } else if (provider === "bedrock" || provider === "aws") {
     env.CLAUDE_CODE_USE_BEDROCK = "1";
-  } else if (provider === "vertex") {
+    delete env.CLAUDE_CODE_USE_VERTEX;
+    credential = "image:bedrock";
+  } else if (provider === "vertex" || provider === "gcp" || provider === "google-vertex") {
     env.CLAUDE_CODE_USE_VERTEX = "1";
-  } else if (baseUrl) {
-    // An Anthropic-compatible gateway (LiteLLM, a router, …).
-    env.ANTHROPIC_BASE_URL = baseUrl;
-    if (apiKey) env.ANTHROPIC_AUTH_TOKEN = apiKey;
+    delete env.CLAUDE_CODE_USE_BEDROCK;
+    credential = "image:vertex";
   } else {
-    warning = `LLM provider "${provider}" is not an Anthropic-compatible backbone for Claude Code; using the image default`;
+    const gateway = baseUrl || (env[gatewayEnvName(provider)] || "").trim() || (env.CLAUDE_CREATURE_LLM_GATEWAY || "").trim();
+    if (gateway) {
+      takeOver();
+      env.ANTHROPIC_BASE_URL = gateway;
+      // A gateway authenticates with a bearer token; the CLI sends
+      // ANTHROPIC_AUTH_TOKEN as `Authorization: Bearer …`.
+      if (apiKey) env.ANTHROPIC_AUTH_TOKEN = apiKey;
+      delete env.CLAUDE_CODE_USE_BEDROCK;
+      delete env.CLAUDE_CODE_USE_VERTEX;
+      credential = apiKey ? "agent:ANTHROPIC_AUTH_TOKEN" : "gateway";
+      warning = `LLM provider "${provider}" is served through the Anthropic-compatible gateway ${gateway}`;
+    } else {
+      warning =
+        `LLM provider "${provider}" is not an Anthropic-compatible backbone, and no gateway is configured ` +
+        `for it (${gatewayEnvName(provider)} or CLAUDE_CREATURE_LLM_GATEWAY) — this run used the creature's ` +
+        `default backbone instead of the agent's provider`;
+    }
   }
-  if (baseUrl && !env.ANTHROPIC_BASE_URL) env.ANTHROPIC_BASE_URL = baseUrl;
-  return { model: model && model.trim() ? model.trim() : undefined, warning };
+  return { model: model && model.trim() ? model.trim() : undefined, warning, provider: provider || "anthropic", credential };
 }
 
 /** Build the child environment: inherited, scrubbed, then per-run overrides. */
@@ -129,9 +184,19 @@ export function buildChildEnv({ env = process.env, llm, configDir, home, extra =
   childEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = childEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || "1";
   if (configDir) childEnv.CLAUDE_CONFIG_DIR = configDir;
   if (home) childEnv.HOME = home;
-  const { model, warning } = applyLlmOverride(childEnv, llm);
+  const { model, warning, provider, credential } = applyLlmOverride(childEnv, llm);
   Object.assign(childEnv, extra);
-  return { env: childEnv, model, warning };
+  return { env: childEnv, model, warning, provider, credential };
+}
+
+/** How this run will authenticate, for the boot log. Never the credential itself. */
+export function credentialSource(env) {
+  if (env.CLAUDE_CODE_USE_BEDROCK) return "bedrock";
+  if (env.CLAUDE_CODE_USE_VERTEX) return "vertex";
+  if (env.ANTHROPIC_AUTH_TOKEN) return "ANTHROPIC_AUTH_TOKEN";
+  if (env.ANTHROPIC_API_KEY) return "ANTHROPIC_API_KEY";
+  if (env.CLAUDE_CODE_OAUTH_TOKEN) return "CLAUDE_CODE_OAUTH_TOKEN";
+  return "none";
 }
 
 /**
@@ -180,13 +245,16 @@ export async function runClaude(opts) {
   }
 
   const configDir = (env.CLAUDE_CREATURE_CONFIG_DIR || "").trim() || undefined;
-  const { env: childEnv, model: llmModel, warning } = buildChildEnv({
+  const { env: childEnv, model: llmModel, warning, provider, credential } = buildChildEnv({
     env,
     llm,
     configDir,
     home: drop ? drop.home : undefined,
   });
   if (warning) warnings.push(warning);
+  // What this run will authenticate as — reported so an operator can tell an
+  // agent's own key from the image's, without either ever being logged.
+  const backbone = { provider, credential: credential || credentialSource(childEnv), auth: credentialSource(childEnv) };
 
   const { command, prefixArgs } = resolveCli(env);
   const args = [...prefixArgs, "--print", "--output-format", "stream-json", "--verbose", "--permission-mode", mode];
@@ -294,9 +362,9 @@ export async function runClaude(opts) {
   const outcome = await Promise.race([exited, spawnFailure]);
   clearTimeout(killTimer);
   if (outcome instanceof Error) {
-    return { result: null, messages, exitCode: null, timedOut, stderr: `${outcome.message}\n${stderr}`, argv: [command, ...args], warnings, stdoutTail };
+    return { result: null, messages, exitCode: null, timedOut, stderr: `${outcome.message}\n${stderr}`, argv: [command, ...args], warnings, stdoutTail, backbone };
   }
-  return { result, messages, exitCode: outcome, timedOut, stderr, argv: [command, ...args], warnings, stdoutTail };
+  return { result, messages, exitCode: outcome, timedOut, stderr, argv: [command, ...args], warnings, stdoutTail, backbone };
 }
 
 /**

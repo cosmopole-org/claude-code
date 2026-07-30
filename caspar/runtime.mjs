@@ -218,6 +218,9 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   }
 
   const initMessage = run.messages.find((m) => m?.type === "system" && m.subtype === "init");
+  // Which backbone actually served this run, and whether it authenticated with the
+  // agent's own key or the image's. Never the credential itself.
+  if (run.backbone) log("CLAUDE_BACKBONE", { ...run.backbone, model: initMessage?.model, apiKeySource: initMessage?.apiKeySource });
   const result = buildResult(objective, run.result, mapper, {
     durationMs: Date.now() - started,
     timedOut: run.timedOut,

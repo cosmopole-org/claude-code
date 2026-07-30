@@ -61,81 +61,40 @@ Output (stdout, machine-readable — the CI greps these):
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import io
 import os
-import subprocess
 import sys
 import tarfile
-import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
+from caspar_deploy_common import (  # noqa: E402
+    DEPLOY_USER,
+    NODE_HOST,
+    NODE_PORT,
+    VM_MAX_UNLIMITED,
+    apply_ca,
+    b64_bytes,
+    bad,
+    bake_snippet,
+    docker_image_context,
+    docker_image_id,
+    env_any,
+    info,
+    ok,
+    stamp_context,
+    truthy,
+    vm_label,
+    vm_max_seconds,
+    wait_for_image,
+    warn,
+)
 from caspar_signaling import CasparSignalingClient  # noqa: E402
 
-GREEN, RED, YELLOW, CYAN, NC = "\033[0;32m", "\033[0;31m", "\033[0;33m", "\033[0;36m", "\033[0m"
-
-
-def info(m: str) -> None:
-    print(f"{CYAN}[deploy]{NC} {m}", flush=True)
-
-
-def ok(m: str) -> None:
-    print(f"{GREEN}[ ok ]{NC} {m}", flush=True)
-
-
-def warn(m: str) -> None:
-    print(f"{YELLOW}[warn]{NC} {m}", flush=True)
-
-
-def bad(m: str) -> None:
-    print(f"{RED}[fail]{NC} {m}", flush=True)
-
-
-def env_any(*names: str, default: str = "") -> str:
-    for name in names:
-        value = os.environ.get(name, "").strip()
-        if value:
-            return value
-    return default
-
-
-def truthy(value: str) -> bool:
-    return str(value).strip().lower() not in ("", "0", "false", "no", "off")
-
-
-NODE_HOST = env_any("CASPAR_NODE_HOST", default="127.0.0.1")
-NODE_PORT = int(env_any("CASPAR_NODE_PORT", default="8074"))
-# The davinci deploy operator, on purpose: reusing the program id the Decillion
-# manifest already records requires logging in as the account that owns it.
-DEPLOY_USER = env_any("CASPAR_DEPLOY_USER", "CLAUDE_ADMIN_USER", "DAVINCI_ADMIN_USER", default="davinci_admin")
 ENTITY_ID = env_any("CLAUDE_ENTITY_ID", "DAVINCI_ENTITY_ID", default="davinci")
-CA_BUNDLE_PATH = env_any("CASPAR_CA_BUNDLE", default="/etc/ssl/certs/ca-certificates.crt")
-
-# The node has no true "unlimited" exec cap (`runEntity` clamps <= 0 to 60 and
-# always spawns a reaper), so "unlimited" is a very large but i64-safe value.
-VM_MAX_UNLIMITED = 10_000_000_000
-
-# Label stamped into the image, carrying a digest of the exact build context it
-# was built from. It is what lets a redeploy tell "the node already built this"
-# from "the node has not finished building yet".
-CONTEXT_LABEL = "org.decillion.build-context"
-
-# Substituted into the Dockerfile at every `CA_MARKER` — once per build stage — so
-# the egress-gateway CA is trusted both while the image installs dependencies and
-# while the creature makes API calls. A host with a TLS-intercepting proxy fails
-# every dependency download without it.
-CA_MARKER = "# >>> caspar-ca <<<"
-CA_SNIPPET = (
-    "COPY ca-certificates.crt /etc/ssl/certs/caspar-ca.crt\n"
-    "ENV SSL_CERT_FILE=/etc/ssl/certs/caspar-ca.crt "
-    "REQUESTS_CA_BUNDLE=/etc/ssl/certs/caspar-ca.crt "
-    "NODE_EXTRA_CA_CERTS=/etc/ssl/certs/caspar-ca.crt"
-)
 
 # The backbone credentials + runtime knobs to bake into the image. Read from this
 # host's environment only — never written to the repo, never sent in a signal.
@@ -189,29 +148,6 @@ def bake_env() -> Dict[str, str]:
     return env
 
 
-def bake_snippet(env: Dict[str, str]) -> str:
-    """A Dockerfile ``ENV`` line baking key=value pairs into the image."""
-    parts = []
-    for key, value in env.items():
-        if value == "":
-            continue
-        escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
-        parts.append(f'{key}="{escaped}"')
-    return ("ENV " + " ".join(parts) + "\n") if parts else ""
-
-
-def b64_bytes(data: bytes) -> str:
-    return base64.b64encode(data).decode()
-
-
-def ca_bundle_bytes() -> Optional[bytes]:
-    try:
-        data = Path(CA_BUNDLE_PATH).read_bytes()
-        return data if data.strip() else None
-    except OSError:
-        return None
-
-
 # Directories/files of this repo that go into the image build context. `src/` is
 # there because the creature's agent is compiled FROM THIS SOURCE inside the image
 # (see caspar/Dockerfile); node_modules, the web app and the docs are not needed to
@@ -222,18 +158,18 @@ CONTEXT_EXCLUDE_SUFFIXES = (".map", ".log")
 CONTEXT_EXCLUDE_DIRS = {"__pycache__", "node_modules", ".git"}
 
 
-def _tar_filter(info: tarfile.TarInfo):
-    parts = set(info.name.split("/"))
+def _tar_filter(entry: tarfile.TarInfo):
+    parts = set(entry.name.split("/"))
     if parts & CONTEXT_EXCLUDE_DIRS:
         return None
-    if info.name.endswith(CONTEXT_EXCLUDE_SUFFIXES):
+    if entry.name.endswith(CONTEXT_EXCLUDE_SUFFIXES):
         return None
     # Deterministic metadata: the context digest must not change just because a
     # file was checked out at a different time or by a different user.
-    info.uid = info.gid = 0
-    info.uname = info.gname = "root"
-    info.mtime = 0
-    return info
+    entry.uid = entry.gid = 0
+    entry.uname = entry.gname = "root"
+    entry.mtime = 0
+    return entry
 
 
 def bundle_tar_gz() -> bytes:
@@ -267,88 +203,6 @@ def bundle_tar_gz() -> bytes:
     return buf.getvalue()
 
 
-def context_digest(dockerfile: bytes, files_b64: Dict[str, str]) -> str:
-    """sha256 over the whole build context (Dockerfile + every shipped file)."""
-    h = hashlib.sha256()
-    h.update(dockerfile)
-    for name in sorted(files_b64 or {}):
-        h.update(name.encode())
-        h.update(files_b64[name].encode())
-    return h.hexdigest()
-
-
-def stamp_context(dockerfile: bytes, files_b64: Dict[str, str]) -> Tuple[bytes, str]:
-    """Append the context LABEL to a Dockerfile. Returns (dockerfile, digest)."""
-    digest = context_digest(dockerfile, files_b64)
-    return dockerfile + f'\nLABEL {CONTEXT_LABEL}="{digest}"\n'.encode(), digest
-
-
-def image_tag(program_id: str, entity_id: str) -> str:
-    return f"{program_id.replace('@', '_')}/{entity_id}"
-
-
-def docker_image_id(program_id: str, entity_id: str) -> str:
-    try:
-        out = subprocess.run(["docker", "images", "--no-trunc", "--format", "{{.ID}}", image_tag(program_id, entity_id)],
-                             capture_output=True, text=True, timeout=15)
-        lines = [line.strip() for line in out.stdout.splitlines() if line.strip()]
-        return lines[0] if lines else ""
-    except Exception:  # noqa: BLE001 — docker may not be queryable from here
-        return ""
-
-
-def docker_image_context(program_id: str, entity_id: str) -> str:
-    try:
-        out = subprocess.run(
-            ["docker", "inspect", "--format", '{{index .Config.Labels "' + CONTEXT_LABEL + '"}}',
-             image_tag(program_id, entity_id)],
-            capture_output=True, text=True, timeout=15)
-        return out.stdout.strip() if out.returncode == 0 else ""
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-def wait_for_image(program_id: str, entity_id: str, *, timeout: int,
-                   prev_image_id: str = "", expect_context: str = "") -> bool:
-    """Wait until the node has (re)built the entity's image.
-
-    The node builds asynchronously and only re-tags on success, so on a redeploy
-    the old tag is present the whole time — waiting for the context digest to
-    appear is what makes this both correct and terminating (an unchanged context
-    is already satisfied, so a no-op rebuild returns at once).
-    """
-    tag = image_tag(program_id, entity_id)
-    deadline = time.time() + timeout
-    info(f"waiting for the node to build image {tag} (≤{timeout}s)…")
-    while time.time() < deadline:
-        if expect_context and docker_image_context(program_id, entity_id) == expect_context:
-            ok(f"image built from the deployed context: {tag}")
-            return True
-        current = docker_image_id(program_id, entity_id)
-        if prev_image_id and current and current != prev_image_id:
-            ok(f"image rebuilt: {tag} -> {current[:19]}")
-            return True
-        if not prev_image_id and not expect_context and current:
-            ok(f"image present: {tag}")
-            return True
-        time.sleep(3)
-    warn(f"image {tag} did not appear/change within {timeout}s — proceeding with the current image; "
-         "check the node's build logs if the entity misbehaves (a host that cannot query docker "
-         "always reports empty here, which must not fail an otherwise fine deploy)")
-    return True
-
-
-def vm_max_seconds() -> int:
-    raw = env_any("CLAUDE_VM_MAX_SECONDS", "DAVINCI_VM_MAX_SECONDS", default="unlimited").lower()
-    if raw in ("0", "-1", "none", "inf", "infinite", "unlimited", "immortal", "forever"):
-        return VM_MAX_UNLIMITED
-    try:
-        value = int(raw)
-    except ValueError:
-        return VM_MAX_UNLIMITED
-    return VM_MAX_UNLIMITED if value <= 0 else value
-
-
 def compose_dockerfile(files: Dict[str, str]) -> Tuple[bytes, str]:
     """The image's Dockerfile: repo file + build mode + CA + baked env + label."""
     dockerfile = (REPO / "caspar" / "Dockerfile").read_bytes()
@@ -375,12 +229,7 @@ def compose_dockerfile(files: Dict[str, str]) -> Tuple[bytes, str]:
         dockerfile = dockerfile.replace(b"ARG CLAUDE_CREATURE_CLI_VERSION",
                                         f"ARG CLAUDE_CREATURE_CLI_VERSION={cli_version}".encode())
 
-    ca = ca_bundle_bytes()
-    if ca is not None:
-        files["ca-certificates.crt"] = b64_bytes(ca)
-        dockerfile = dockerfile.replace(CA_MARKER.encode(), CA_SNIPPET.encode())
-    else:
-        warn("no host CA bundle found — the image will trust only its own roots")
+    dockerfile = apply_ca(dockerfile, files)
     baked = bake_env()
     if baked:
         # Report the names only — a key must never reach a log.
@@ -461,8 +310,8 @@ def main() -> int:
         ram = int(env_any("CLAUDE_VM_RAM_MB", "DAVINCI_VM_RAM_MB", default="2048"))
         disk = int(env_any("CLAUDE_VM_DISK_GB", "DAVINCI_VM_DISK_GB", default="8"))
         cpus = int(env_any("CLAUDE_VM_CPUS", "DAVINCI_VM_CPUS", default="2"))
-        max_seconds = vm_max_seconds()
-        label = "unlimited (~317y)" if max_seconds == VM_MAX_UNLIMITED else f"{max_seconds}s"
+        max_seconds = vm_max_seconds("CLAUDE_VM_MAX_SECONDS", "DAVINCI_VM_MAX_SECONDS")
+        label = vm_label(max_seconds)
         # forceRestart is essential after a (re)deploy: without it the node's
         # idempotent run_vm resumes the OLD container (old code) instead of
         # creating a fresh one from the just-built image.

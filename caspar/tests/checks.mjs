@@ -226,6 +226,53 @@ await check("token usage maps to what the platform bills", () => {
   assert.equal(usage.totalTokens, 1050);
 });
 
+await check("an agent's own API key takes over the run from the image's credentials", () => {
+  // The image is deployed with the platform's own credentials baked in; an agent
+  // that carries its own must not silently run (and bill) on the platform's.
+  const imageEnv = {
+    PATH: "/usr/bin",
+    ANTHROPIC_API_KEY: "sk-platform-key",
+    CLAUDE_CODE_OAUTH_TOKEN: "oauth-platform-token",
+    ANTHROPIC_AUTH_TOKEN: "platform-bearer",
+  };
+  const own = buildChildEnv({ env: imageEnv, llm: { provider: "anthropic", models: ["claude-opus-5"], api_key: "sk-agent-key" } });
+  assert.equal(own.env.ANTHROPIC_API_KEY, "sk-agent-key");
+  assert.equal(own.env.CLAUDE_CODE_OAUTH_TOKEN, undefined, "the image's OAuth token must not outrank the agent's key");
+  assert.equal(own.env.ANTHROPIC_AUTH_TOKEN, undefined, "the image's bearer token must not outrank the agent's key");
+  assert.equal(own.model, "claude-opus-5");
+  assert.equal(own.credential, "agent:ANTHROPIC_API_KEY");
+
+  // An agent with no override keeps the image's backbone untouched.
+  const inherited = buildChildEnv({ env: imageEnv });
+  assert.equal(inherited.env.ANTHROPIC_API_KEY, "sk-platform-key");
+  assert.equal(inherited.env.CLAUDE_CODE_OAUTH_TOKEN, "oauth-platform-token");
+  assert.equal(inherited.model, undefined);
+});
+
+await check("a non-Anthropic provider is gateway-routed when configured, and reported when not", () => {
+  // davinci spoke gemini/openai/grok natively; Claude Code speaks the Anthropic
+  // API, so those providers are served through a gateway the operator configures.
+  const routed = {};
+  const viaGateway = applyLlmOverride(
+    { ...routed, CLAUDE_CREATURE_LLM_GATEWAY_GEMINI: "https://gw.internal/anthropic", ANTHROPIC_API_KEY: "sk-platform" },
+    { provider: "gemini", models: ["gemini-3-pro"], api_key: "agent-gemini-key" },
+  );
+  assert.equal(viaGateway.model, "gemini-3-pro");
+  assert.match(viaGateway.warning, /gateway/);
+
+  const env = { CLAUDE_CREATURE_LLM_GATEWAY_GEMINI: "https://gw.internal/anthropic", ANTHROPIC_API_KEY: "sk-platform" };
+  applyLlmOverride(env, { provider: "gemini", api_key: "agent-gemini-key" });
+  assert.equal(env.ANTHROPIC_BASE_URL, "https://gw.internal/anthropic");
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, "agent-gemini-key");
+  assert.equal(env.ANTHROPIC_API_KEY, undefined, "the platform's key must not leak to a third-party gateway");
+
+  // With nothing configured the run still happens, and says what it fell back to.
+  const unconfigured = {};
+  const res = applyLlmOverride(unconfigured, { provider: "gemini", api_key: "k" });
+  assert.match(res.warning, /no gateway is configured/);
+  assert.equal(unconfigured.ANTHROPIC_BASE_URL, undefined);
+});
+
 await check("a per-agent LLM override lands in the child environment", () => {
   const anthropic = buildChildEnv({ env: { PATH: "/usr/bin", CLAUDE_CODE_SESSION_ID: "leaked" }, llm: { provider: "anthropic", models: ["claude-opus-5"], api_key: "sk-test-key" } });
   assert.equal(anthropic.env.ANTHROPIC_API_KEY, "sk-test-key");
@@ -233,15 +280,13 @@ await check("a per-agent LLM override lands in the child environment", () => {
   assert.equal(anthropic.env.CLAUDE_CODE_SESSION_ID, undefined, "the parent's session id must not leak into the child");
   assert.equal(anthropic.env.CLAUDE_CODE_ENTRYPOINT, "caspar-creature");
 
+  // An agent may name its own gateway directly, instead of relying on one the
+  // operator configured for the provider.
   const gateway = {};
   const { warning } = applyLlmOverride(gateway, { provider: "openrouter", api_key: "k", base_url: "https://gw.example/v1" });
   assert.equal(gateway.ANTHROPIC_BASE_URL, "https://gw.example/v1");
   assert.equal(gateway.ANTHROPIC_AUTH_TOKEN, "k");
-  assert.equal(warning, undefined);
-
-  const unusable = {};
-  const res = applyLlmOverride(unusable, { provider: "gemini", api_key: "k" });
-  assert.match(res.warning || "", /not an Anthropic-compatible backbone/);
+  assert.match(warning, /gateway https:\/\/gw\.example\/v1/);
 });
 
 await check("trajectory events land on the channels the client renders", () => {
