@@ -277,7 +277,18 @@ export async function runClaude(opts) {
     warnings.push("running as root with no unprivileged user available: permission mode degraded to acceptEdits");
   }
 
-  const configDir = (env.CLAUDE_CREATURE_CONFIG_DIR || "").trim() || undefined;
+  const requestedConfigDir = (env.CLAUDE_CREATURE_CONFIG_DIR || "").trim() || undefined;
+  const configDir = resolveConfigDir({
+    configured: requestedConfigDir,
+    home: drop ? drop.home : undefined,
+    uid: drop ? drop.uid : undefined,
+    gid: drop ? drop.gid : undefined,
+  });
+  if (requestedConfigDir && configDir !== requestedConfigDir) {
+    // The CLI aborts with no output when it cannot write CLAUDE_CONFIG_DIR, so a
+    // fallback here is the difference between a real answer and a silent failure.
+    warnings.push(`CLAUDE_CONFIG_DIR ${requestedConfigDir} is not writable by the agent user; using ${configDir || "the CLI default"} instead`);
+  }
   const { env: childEnv, model: llmModel, warning, provider, credential, proxy } = buildChildEnv({
     env,
     llm,
@@ -464,4 +475,45 @@ function chownTree(root, uid, gid, budget = 5000) {
 /** A per-run temporary directory (sockets, MCP config) inside the container. */
 export function runTempDir(prefix = "caspar-run-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+/**
+ * The CLI's config/state directory (`CLAUDE_CONFIG_DIR`), guaranteed writable.
+ *
+ * Claude Code creates and writes this directory at startup (config, session
+ * state, locks); if it cannot, the CLI aborts **before emitting any stream-json**
+ * — it exits 0 with no output, which the bridge can only report as "the agent
+ * produced no result (exit code 0)". The creature's default is `/data/claude-config`,
+ * under the VM's persistent mount — which the node commonly mounts **root-owned**,
+ * so the unprivileged user the CLI runs as cannot write it. (The workspace has
+ * always guarded against this via `workspaceRoot()`; the config dir did not, which
+ * is why an OpenAI/Gemini/etc. agent could get a silent empty reply.)
+ *
+ * So the configured dir is used only when it can actually be created and written;
+ * otherwise we fall back to a writable location — the run's HOME, then a temp dir —
+ * creating (and, when dropping privileges, chowning) it so the child can use it.
+ * Returns `undefined` only if nothing is writable, letting the CLI use its own
+ * default.
+ */
+export function resolveConfigDir({ configured, home, uid, gid } = {}) {
+  const base = home || os.homedir() || os.tmpdir();
+  const candidates = [configured, path.join(base, ".claude-config"), path.join(os.tmpdir(), "caspar-claude-config")].filter(Boolean);
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      if (Number.isFinite(uid) && Number.isFinite(gid)) {
+        try {
+          fs.chownSync(dir, uid, gid);
+        } catch {
+          /* best effort: a pre-owned dir is fine */
+        }
+      }
+      // Writable by *this* process; when dropping we chowned it to the child above.
+      fs.accessSync(dir, fs.constants.W_OK);
+      return dir;
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  return undefined;
 }

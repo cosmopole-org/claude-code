@@ -642,6 +642,29 @@ await check("a result line emitted without a trailing newline is still parsed (f
   assert.equal(result.answer, "The deploy is green.");
 });
 
+await check("a no-result reply surfaces the CLI's non-JSON stdout so the cause is visible", async () => {
+  // The CLI prints an error/notice to stdout instead of stream-json and exits 0.
+  // stderr is empty, no result line — exactly the opaque 'exit code 0' failure.
+  // The reply must carry what the CLI actually said.
+  const { result } = await serveWithFakeCli({
+    scenario: { exitCode: 0, stdoutNoise: "This version of Claude Code is no longer supported. Please update.", messages: [] },
+  });
+  assert.equal(result.success, false);
+  assert.match(result.error, /no result \(exit code 0\)/);
+  assert.match(result.error, /non-JSON to stdout/);
+  assert.match(result.error, /no longer supported/);
+});
+
+await check("a no-result reply names the messages the CLI did emit when stdout is clean", async () => {
+  // The CLI booted (system/init) but never produced a terminal result and left
+  // nothing on stderr/stdout — the reply reports which messages it did see.
+  const { result } = await serveWithFakeCli({
+    scenario: { exitCode: 0, messages: [{ type: "system", subtype: "init", session_id: "s", model: "m", tools: [], mcp_servers: [] }] },
+  });
+  assert.equal(result.success, false);
+  assert.match(result.error, /messages seen: system\/init/);
+});
+
 await check("a run that never finishes is ended by its wall-clock budget", async () => {
   const { result, signals } = await serveWithFakeCli({ scenario: { hang: true }, envOverrides: { CLAUDE_CREATURE_MAX_WALL_SECONDS: "2" } });
   assert.equal(result.success, false);
