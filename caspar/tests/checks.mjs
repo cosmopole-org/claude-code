@@ -17,7 +17,8 @@
  *     one terminal `davinci/result` is sent, through the proxy;
  *   • the result carries the answer, billable token usage and a non-array plan;
  *   • the space's creatures are employable over MCP, with platform-pinned
- *     arguments winning over the model's;
+ *     arguments winning over the model's, and a tool added to a space appears on
+ *     the next prompt (the catalog is per-prompt, not baked in);
  *   • a prompt delivered while another is being served is queued, not dropped;
  *   • a failed run, a run that never finishes, and a crashed CLI all still reply.
  *
@@ -560,6 +561,59 @@ await check("a space's creatures are wired into the run as an MCP server", async
   assert.match(config.mcpServers.caspar.args[0], /mcpStdioServer\.mjs$/);
   assert.ok(config.mcpServers.caspar.env.CASPAR_TOOL_SOCKET);
   assert.ok(invocation.argv.includes("--strict-mcp-config"));
+});
+
+await check("tools added to a space appear on the next prompt (dynamic catalog)", async () => {
+  // The backend sends config.tools fresh with EVERY prompt (DiscoveryService
+  // rebuilds it from the space's current programs), and the runtime rebuilds its
+  // MCP tool server per prompt from that catalog. So a tool attached to a space
+  // later is available on the very next prompt — no redeploy, no per-agent wiring.
+  // Prove it by listing tools over the REAL MCP server for two successive catalogs.
+  const listToolsFor = async (catalog) => {
+    const { tools } = buildToolDefinitions(catalog);
+    const socketPath = path.join(tempDir("caspar-dyn-"), "tools.sock");
+    const server = await new ToolSocketServer(socketPath, { list: () => tools, call: async () => ({ ok: true }) }).start();
+    const child = spawn(process.execPath, [MCP_SERVER], { env: { ...process.env, CASPAR_TOOL_SOCKET: socketPath }, stdio: ["pipe", "pipe", "pipe"] });
+    const responses = new Map();
+    let buffer = "";
+    child.stdout.setEncoding("utf-8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      let i;
+      while ((i = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, i).trim();
+        buffer = buffer.slice(i + 1);
+        if (!line) continue;
+        const m = JSON.parse(line);
+        const w = responses.get(m.id);
+        if (w) {
+          responses.delete(m.id);
+          w(m);
+        }
+      }
+    });
+    const rpc = (id, method, params) =>
+      new Promise((resolve) => {
+        responses.set(id, resolve);
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+      });
+    try {
+      await rpc(1, "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "c", version: "1" } });
+      const listed = await rpc(2, "tools/list", {});
+      return listed.result.tools.map((t) => t.name).sort();
+    } finally {
+      child.kill();
+      await server.stop();
+    }
+  };
+
+  const webSearch = { name: "web search", tool_id: "40@global", program_id: "40@global", entity_id: "web_search", arg_schema: { query: { type: "string" } }, required: ["query"] };
+  const sandbox = { name: "project sandbox", tool_id: "31@global", program_id: "31@global", entity_id: "vercel_sandbox", arg_schema: { command: { type: "string" } }, required: ["command"], function: "exec", defaults: { space_id: "space-1" } };
+
+  const before = await listToolsFor([webSearch]);
+  const after = await listToolsFor([webSearch, sandbox]);
+  assert.deepEqual(before, ["web_search"], "the first prompt sees only the tool the space had then");
+  assert.deepEqual(after, ["project_sandbox", "web_search"], "a tool added to the space appears on the next prompt");
 });
 
 await check("a failed run still answers, with the reason", async () => {
