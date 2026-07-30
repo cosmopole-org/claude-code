@@ -55,13 +55,23 @@ export function resolveModel(claudeResult, initMessage) {
  * @param extra         `{ durationMs, timedOut, exitCode, stderr, sessionId, initMessage, error, warnings }`
  */
 export function buildResult(objective, claudeResult, mapper, extra = {}) {
-  const { durationMs = 0, timedOut = false, exitCode = null, stderr = "", sessionId, initMessage, error, warnings = [] } = extra;
+  const { durationMs = 0, timedOut = false, exitCode = null, stderr = "", sessionId, initMessage, error } = extra;
+  let warnings = Array.isArray(extra.warnings) ? extra.warnings : [];
 
   const usage = normalizeUsage(claudeResult?.usage);
-  const succeeded = Boolean(claudeResult && claudeResult.subtype === "success" && !claudeResult.is_error && !timedOut);
-  const answer = succeeded
-    ? String(claudeResult.result ?? "")
-    : "";
+
+  // Recovery for a run that ended cleanly (exit 0, no timeout, no thrown error)
+  // but whose terminal `result` line never reached us — an unterminated final
+  // line, or stdout truncated as the CLI exited. If the agent had already
+  // produced assistant text, that IS the answer; reporting "produced no result"
+  // would throw away a real reply. Only a clean exit qualifies: a non-zero exit
+  // or a timeout is a genuine failure and keeps its own diagnostic message.
+  const recoveredAnswer = typeof mapper?.lastAssistantText === "string" ? mapper.lastAssistantText.trim() : "";
+  const recovered = !claudeResult && !timedOut && !error && exitCode === 0 && Boolean(recoveredAnswer);
+  if (recovered) warnings = [...warnings, "the CLI exited without a terminal result line; recovered the answer from the last assistant message"];
+
+  const succeeded = recovered || Boolean(claudeResult && claudeResult.subtype === "success" && !claudeResult.is_error && !timedOut);
+  const answer = !succeeded ? "" : claudeResult ? String(claudeResult.result ?? "") : recoveredAnswer;
 
   const failure =
     error ||

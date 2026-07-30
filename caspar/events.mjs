@@ -105,6 +105,13 @@ export class TrajectoryMapper {
     this.todos = [];
     this.toolNamesById = new Map();
     this.toolCallCount = 0;
+    /**
+     * The agent's most recent assistant text. It is the fallback answer when the
+     * terminal `result` line never reaches the bridge (e.g. an unterminated final
+     * line, or stdout truncated at exit): the run still spoke, so `buildResult`
+     * can recover its answer instead of reporting "produced no result".
+     */
+    this.lastAssistantText = "";
   }
 
   _event(kind, message, data, channel) {
@@ -183,6 +190,7 @@ export class TrajectoryMapper {
       if (block.type === "thinking" && block.thinking) {
         events.push(this._event("reason", block.thinking, {}, "thought"));
       } else if (block.type === "text" && block.text?.trim()) {
+        this.lastAssistantText = block.text.trim();
         events.push(this._event("reason", block.text, {}, "thought"));
       } else if (block.type === "tool_use") {
         this.toolCallCount += 1;
