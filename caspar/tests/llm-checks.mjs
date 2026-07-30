@@ -15,7 +15,7 @@
 import assert from "node:assert/strict";
 
 import { OpenAIToAnthropicStream, estimateTokens, toAnthropicResponse, toOpenAIRequest } from "../llm/anthropicOpenAI.mjs";
-import { applyLlmOverride } from "../claudeRunner.mjs";
+import { applyLlmOverride, buildChildEnv, defaultLlmFromEnv } from "../claudeRunner.mjs";
 import { LlmProxy } from "../llm/llmProxy.mjs";
 import { resolveProvider } from "../llm/providers.mjs";
 import { FakeOpenAI } from "./fakeOpenAI.mjs";
@@ -80,6 +80,40 @@ await check("each provider routes to the built-in proxy, keeping the key out of 
     assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
     assert.notEqual(env.ANTHROPIC_API_KEY, "agent-secret-key");
   }
+});
+
+await check("a non-Anthropic DEFAULT backbone runs every un-overridden agent (no Anthropic key needed)", () => {
+  // The whole platform on OpenRouter: deploy-time env sets the default backbone,
+  // and there is no Anthropic key anywhere.
+  const deployEnv = {
+    PATH: "/usr/bin",
+    CLAUDE_CREATURE_LLM_PROVIDER: "openrouter",
+    CLAUDE_CREATURE_LLM_API_KEY: "or-platform-key",
+    CLAUDE_CREATURE_MODEL: "anthropic/claude-3.5-sonnet",
+  };
+  assert.deepEqual(defaultLlmFromEnv(deployEnv), {
+    provider: "openrouter",
+    api_key: "or-platform-key",
+    models: ["anthropic/claude-3.5-sonnet"],
+  });
+
+  // An agent with NO per-agent override → the default backbone (OpenRouter proxy).
+  const noOverride = buildChildEnv({ env: deployEnv, llm: undefined });
+  assert.ok(noOverride.proxy, "an un-overridden agent uses the default backbone via the proxy");
+  assert.equal(noOverride.proxy.provider.id, "openrouter");
+  assert.equal(noOverride.proxy.apiKey, "or-platform-key");
+  assert.equal(noOverride.model, "anthropic/claude-3.5-sonnet");
+  assert.equal(noOverride.env.ANTHROPIC_API_KEY, "sk-caspar-local-proxy", "the CLI gets a placeholder, not the real key");
+  assert.equal(noOverride.env.CLAUDE_CREATURE_LLM_API_KEY, undefined, "the default-backbone key never reaches the CLI env");
+
+  // A per-agent override still wins over the default.
+  const overridden = buildChildEnv({ env: deployEnv, llm: { provider: "anthropic", models: ["claude-opus-5"], api_key: "sk-agent" } });
+  assert.equal(overridden.proxy, undefined, "the per-agent Anthropic override wins over the OpenRouter default");
+  assert.equal(overridden.env.ANTHROPIC_API_KEY, "sk-agent");
+
+  // With no default configured, there is no synthesized override (image Anthropic default).
+  assert.equal(defaultLlmFromEnv({ PATH: "/usr/bin" }), null);
+  assert.equal(defaultLlmFromEnv({ CLAUDE_CREATURE_LLM_PROVIDER: "anthropic" }), null, "a plain anthropic default with no key stays on the image key");
 });
 
 await check("anthropic stays native; bedrock/vertex stay 3P; a keyless provider falls back", () => {

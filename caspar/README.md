@@ -217,6 +217,25 @@ SSE — to OpenAI Chat Completions, calls the provider **with the agent's own ke
 and translates the answer back. So an agent works on any of these from just
 `provider` + `model` + `api_key`, with nothing for the operator to configure.
 
+### Default backbone — run the whole platform on one provider
+
+You do **not** need an Anthropic key. The creature's *default* backbone (used by any
+agent that carries no per-agent `config.llm`) comes from deploy-time env, so an
+operator can run everything on, say, OpenRouter with only an OpenRouter key:
+
+| Env (baked at deploy) | Meaning |
+|---|---|
+| `CLAUDE_CREATURE_LLM_PROVIDER` | Default provider (`openrouter`, `openai`, `gemini`, `xai`, `anthropic`) |
+| `CLAUDE_CREATURE_LLM_API_KEY` | The key for that provider |
+| `CLAUDE_CREATURE_MODEL` | The default model id |
+| `CLAUDE_CREATURE_LLM_BASE_URL` / `CLAUDE_CREATURE_LLM_BASE_<PROVIDER>` | Optional endpoint override |
+
+From Decillion CI this is just the existing `LLM_*` trio: set
+`LLM_PROVIDER=openrouter`, `LLM_API_KEY=<your OpenRouter key>`, `LLM_MODELS=<model>`
+(GitHub Secret/Variables) and `ci-deploy.sh` maps them to the default backbone and
+bakes them in — no `ANTHROPIC_API_KEY` required, and the deploy gate enables on that
+key alone. A per-agent override in Decillion still wins for that agent, per prompt.
+
 - **The agent's key takes over the run.** When `config.llm` carries an `api_key`,
   every credential the image baked in is removed for that run — the agent's
   provider is billed, never the platform's. The real key lives only in the proxy

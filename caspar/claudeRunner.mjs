@@ -205,6 +205,44 @@ export function applyLlmOverride(env, llm) {
   return { model: modelId, warning, provider: provider || "anthropic", credential, proxy };
 }
 
+/** True when a per-agent `config.llm` block actually names something. */
+export function llmHasContent(llm) {
+  if (!llm || typeof llm !== "object") return false;
+  return Boolean(
+    (typeof llm.provider === "string" && llm.provider.trim()) ||
+      (typeof llm.model === "string" && llm.model.trim()) ||
+      (Array.isArray(llm.models) && llm.models.some((m) => typeof m === "string" && m.trim())) ||
+      (typeof llm.api_key === "string" && llm.api_key.trim()) ||
+      (typeof llm.apiKey === "string" && llm.apiKey.trim()),
+  );
+}
+
+/**
+ * The creature's **default backbone**, from deploy-time env — used for any agent
+ * that carries no `config.llm` of its own. This is what lets an operator run the
+ * whole platform on, say, OpenRouter (or OpenAI/Gemini/xAI) instead of Anthropic:
+ * bake `CLAUDE_CREATURE_LLM_PROVIDER` + `CLAUDE_CREATURE_LLM_API_KEY` (+ a
+ * `CLAUDE_CREATURE_MODEL` default) into the image and every un-overridden agent
+ * runs there. Returns `null` when no default provider is configured, so the plain
+ * Anthropic image key stays the default.
+ */
+export function defaultLlmFromEnv(env = process.env) {
+  const provider = (env.CLAUDE_CREATURE_LLM_PROVIDER || "").trim();
+  const apiKey = (env.CLAUDE_CREATURE_LLM_API_KEY || "").trim();
+  const model = (env.CLAUDE_CREATURE_LLM_MODEL || env.CLAUDE_CREATURE_MODEL || "").trim();
+  const baseUrl = (env.CLAUDE_CREATURE_LLM_BASE_URL || "").trim();
+  // Nothing configured, or a plain Anthropic default with no key of its own: let
+  // the image's ANTHROPIC_* env be the default (no synthesized override, no proxy).
+  if (!provider && !apiKey) return null;
+  if ((provider === "" || NATIVE_PROVIDERS.has(provider.toLowerCase())) && !apiKey) return null;
+  const llm = {};
+  if (provider) llm.provider = provider;
+  if (apiKey) llm.api_key = apiKey;
+  if (model) llm.models = [model];
+  if (baseUrl) llm.base_url = baseUrl;
+  return llm;
+}
+
 /** Build the child environment: inherited, scrubbed, then per-run overrides. */
 export function buildChildEnv({ env = process.env, llm, configDir, home, extra = {} } = {}) {
   const childEnv = { ...env };
@@ -217,7 +255,13 @@ export function buildChildEnv({ env = process.env, llm, configDir, home, extra =
   childEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = childEnv.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC || "1";
   if (configDir) childEnv.CLAUDE_CONFIG_DIR = configDir;
   if (home) childEnv.HOME = home;
-  const { model, warning, provider, credential, proxy } = applyLlmOverride(childEnv, llm);
+  // The per-agent override wins; otherwise fall back to the creature's default
+  // backbone (deploy-time env), so an operator can run everything on OpenRouter.
+  const effectiveLlm = llmHasContent(llm) ? llm : defaultLlmFromEnv(env);
+  const { model, warning, provider, credential, proxy } = applyLlmOverride(childEnv, effectiveLlm);
+  // The default backbone's key was read from `env`; never leave it in the child's
+  // environment (the CLI never reads it — the proxy holds it).
+  delete childEnv.CLAUDE_CREATURE_LLM_API_KEY;
   Object.assign(childEnv, extra);
   return { env: childEnv, model, warning, provider, credential, proxy };
 }

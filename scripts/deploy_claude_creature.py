@@ -108,6 +108,13 @@ BAKE_ENV_NAMES = (
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
+    # The creature's DEFAULT backbone for agents with no per-agent override — this
+    # is how the whole platform runs on OpenAI / Gemini / xAI / OpenRouter (through
+    # the built-in translation proxy) with no Anthropic key at all.
+    "CLAUDE_CREATURE_LLM_PROVIDER",
+    "CLAUDE_CREATURE_LLM_API_KEY",
+    "CLAUDE_CREATURE_LLM_MODEL",
+    "CLAUDE_CREATURE_LLM_BASE_URL",
     "CLAUDE_CREATURE_MODEL",
     "CLAUDE_CREATURE_PERMISSION_MODE",
     "CLAUDE_CREATURE_MAX_WALL_SECONDS",
@@ -139,6 +146,10 @@ def bake_env() -> Dict[str, str]:
         names += list(VERTEX_ENV_NAMES)
     if truthy(os.environ.get("CLAUDE_BAKE_PROXY", "")):
         names += list(PROXY_ENV_NAMES)
+    # Per-provider base overrides (CLAUDE_CREATURE_LLM_BASE_OPENROUTER, …) — an
+    # operator repointing a provider's endpoint. Swept generically so a new
+    # provider needs no change here.
+    names += [n for n in os.environ if n.startswith("CLAUDE_CREATURE_LLM_BASE_")]
     env = {name: os.environ[name].strip() for name in names if os.environ.get(name, "").strip()}
     for name in PROXY_ENV_NAMES:
         value = env.get(name, "")
