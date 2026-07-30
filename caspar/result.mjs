@@ -47,6 +47,25 @@ export function resolveModel(claudeResult, initMessage) {
 }
 
 /**
+ * Explain a "no result" run from whatever the CLI *did* leave behind.
+ *
+ * A clean exit with an empty stderr and no `type:"result"` line is otherwise a
+ * dead end for the user: the answer to "why" is usually sitting in the CLI's
+ * non-JSON stdout (a banner, an update/version notice, an early error printed
+ * before the stream started) — which the runner keeps as `stdoutTail` — or, when
+ * even that is empty, in *which* stream-json messages did arrive (init only? an
+ * assistant turn with no terminal result?). Surfacing it turns an opaque failure
+ * into one the operator can act on from the reply alone.
+ */
+export function noResultDiagnostic({ stderr = "", stdoutTail = "", messageTypes = [] } = {}) {
+  const tail = (text) => String(text).trim().split("\n").map((l) => l.trim()).filter(Boolean).slice(-3).join(" | ").slice(0, 400);
+  if (stderr && stderr.trim()) return `: ${tail(stderr)}`;
+  if (stdoutTail && stdoutTail.trim()) return `: the CLI wrote non-JSON to stdout: ${tail(stdoutTail)}`;
+  if (messageTypes.length) return ` — the CLI emitted no final result; messages seen: ${messageTypes.slice(0, 12).join(", ")}`;
+  return " — the CLI produced no output at all (it exited before running the turn; check the backbone credential/model and CLAUDE_BOOT logs)";
+}
+
+/**
  * Build the terminal reply.
  *
  * @param objective     the prompt that was answered
@@ -55,7 +74,8 @@ export function resolveModel(claudeResult, initMessage) {
  * @param extra         `{ durationMs, timedOut, exitCode, stderr, sessionId, initMessage, error, warnings }`
  */
 export function buildResult(objective, claudeResult, mapper, extra = {}) {
-  const { durationMs = 0, timedOut = false, exitCode = null, stderr = "", sessionId, initMessage, error } = extra;
+  const { durationMs = 0, timedOut = false, exitCode = null, stderr = "", stdoutTail = "", sessionId, initMessage, error } = extra;
+  const messageTypes = Array.isArray(extra.messageTypes) ? extra.messageTypes : [];
   let warnings = Array.isArray(extra.warnings) ? extra.warnings : [];
 
   const usage = normalizeUsage(claudeResult?.usage);
@@ -81,7 +101,7 @@ export function buildResult(objective, claudeResult, mapper, extra = {}) {
         ? claudeResult.subtype === "success"
           ? String(claudeResult.result || "the agent reported an error")
           : `${claudeResult.subtype}${Array.isArray(claudeResult.errors) && claudeResult.errors.length ? `: ${claudeResult.errors.join("; ")}` : ""}`
-        : `the agent produced no result (exit code ${exitCode})${stderr ? `: ${stderr.trim().split("\n").slice(-3).join(" | ").slice(0, 400)}` : ""}`);
+        : `the agent produced no result (exit code ${exitCode})${noResultDiagnostic({ stderr, stdoutTail, messageTypes })}`);
 
   const todos = Array.isArray(mapper?.todos) ? mapper.todos : [];
   const plan = {

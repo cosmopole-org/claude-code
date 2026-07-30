@@ -72,6 +72,13 @@ if (scenario.hang) {
   await new Promise((resolve) => setTimeout(resolve, 3_600_000));
 }
 
+// A CLI that prints a non-JSON line to stdout (a banner, a version/update notice,
+// an early error) before/without any stream-json — the runner keeps it as
+// `stdoutTail`, and a "no result" reply must surface it.
+if (typeof scenario.stdoutNoise === "string" && scenario.stdoutNoise) {
+  process.stdout.write(`${scenario.stdoutNoise}\n`);
+}
+
 const messages = scenario.messages || [];
 for (let i = 0; i < messages.length; i++) {
   const message = messages[i];

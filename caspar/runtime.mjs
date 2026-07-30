@@ -218,14 +218,24 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   }
 
   const initMessage = run.messages.find((m) => m?.type === "system" && m.subtype === "init");
+  const messageTypes = run.messages.map((m) => (m?.subtype ? `${m.type}/${m.subtype}` : m?.type)).filter(Boolean);
   // Which backbone actually served this run, and whether it authenticated with the
   // agent's own key or the image's. Never the credential itself.
   if (run.backbone) log("CLAUDE_BACKBONE", { ...run.backbone, model: initMessage?.model, apiKeySource: initMessage?.apiKeySource });
+  // A clean exit that produced no terminal result is the hardest failure to see
+  // from the reply alone — log everything the CLI left behind so the cause (a
+  // credential/model reject that printed to stdout, an early exit before the
+  // turn) is greppable in the VM logs, not just inferable.
+  if (!run.result && !run.timedOut) {
+    log("CLAUDE_NORESULT", { exitCode: run.exitCode, messageTypes, stdoutTail: (run.stdoutTail || "").slice(-800), backbone: run.backbone });
+  }
   const result = buildResult(objective, run.result, mapper, {
     durationMs: Date.now() - started,
     timedOut: run.timedOut,
     exitCode: run.exitCode,
     stderr: run.stderr,
+    stdoutTail: run.stdoutTail,
+    messageTypes,
     sessionId: initMessage?.session_id,
     initMessage,
     warnings: run.warnings,
