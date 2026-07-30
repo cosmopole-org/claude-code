@@ -1,0 +1,119 @@
+/**
+ * The run result, in the shape the Decillion backend already understands.
+ *
+ * Nest reads three things off a creature's terminal reply and nothing else:
+ *
+ *   • `answer`   — the message the user sees (`obj.result ?? obj.answer ?? …`,
+ *                  hence: never put a `result` key on this object);
+ *   • `usage`    — `promptTokens` / `completionTokens`, which is what the prompt
+ *                  is billed on (`billPrompt` → the `promptAgent` cost creature);
+ *   • `durationMs` — the measured run time, also billed.
+ *
+ * `plan` is deliberately an **object**, not an array: an array is Nest's signal
+ * that the agent produced an employment plan for the team broker to execute, and
+ * a Claude Code todo list is not that. The remaining fields (`trace`, `budget`,
+ * `engine`, …) are diagnostics that travel with the reply and show up in the VM
+ * logs and the client's usage label.
+ */
+
+/** Total tokens the platform bills for: everything the model read, and wrote. */
+export function normalizeUsage(usage) {
+  const u = usage && typeof usage === "object" ? usage : {};
+  const input = Number(u.input_tokens || 0);
+  const cacheRead = Number(u.cache_read_input_tokens || 0);
+  const cacheCreation = Number(u.cache_creation_input_tokens || 0);
+  const output = Number(u.output_tokens || 0);
+  const promptTokens = input + cacheRead + cacheCreation;
+  return {
+    promptTokens,
+    completionTokens: output,
+    totalTokens: promptTokens + output,
+    cacheReadTokens: cacheRead,
+    cacheCreationTokens: cacheCreation,
+    // snake_case aliases, for any consumer reading davinci's spelling
+    prompt_tokens: promptTokens,
+    completion_tokens: output,
+  };
+}
+
+/** The model that actually served the run (from `modelUsage`, else the init message). */
+export function resolveModel(claudeResult, initMessage) {
+  const usage = claudeResult?.modelUsage;
+  if (usage && typeof usage === "object") {
+    const names = Object.keys(usage);
+    if (names.length) return names[names.length - 1];
+  }
+  return initMessage?.model || undefined;
+}
+
+/**
+ * Build the terminal reply.
+ *
+ * @param objective     the prompt that was answered
+ * @param claudeResult  the CLI's `type: "result"` message (may be null)
+ * @param mapper        the trajectory mapper (step count + the agent's todo plan)
+ * @param extra         `{ durationMs, timedOut, exitCode, stderr, sessionId, initMessage, error, warnings }`
+ */
+export function buildResult(objective, claudeResult, mapper, extra = {}) {
+  const { durationMs = 0, timedOut = false, exitCode = null, stderr = "", sessionId, initMessage, error, warnings = [] } = extra;
+
+  const usage = normalizeUsage(claudeResult?.usage);
+  const succeeded = Boolean(claudeResult && claudeResult.subtype === "success" && !claudeResult.is_error && !timedOut);
+  const answer = succeeded
+    ? String(claudeResult.result ?? "")
+    : "";
+
+  const failure =
+    error ||
+    (timedOut
+      ? `the run exceeded its wall-clock budget after ${Math.round(durationMs / 1000)}s`
+      : claudeResult
+        ? claudeResult.subtype === "success"
+          ? String(claudeResult.result || "the agent reported an error")
+          : `${claudeResult.subtype}${Array.isArray(claudeResult.errors) && claudeResult.errors.length ? `: ${claudeResult.errors.join("; ")}` : ""}`
+        : `the agent produced no result (exit code ${exitCode})${stderr ? `: ${stderr.trim().split("\n").slice(-3).join(" | ").slice(0, 400)}` : ""}`);
+
+  const todos = Array.isArray(mapper?.todos) ? mapper.todos : [];
+  const plan = {
+    steps: todos.map((t) => ({
+      description: String(t?.content || t?.activeForm || ""),
+      status: String(t?.status || "pending"),
+    })),
+    progress: {
+      done: todos.filter((t) => t?.status === "completed").length,
+      total: todos.length,
+    },
+  };
+
+  const result = {
+    objective,
+    engine: "claude-code",
+    success: succeeded,
+    // The user-facing message. On failure it carries the reason, so a client that
+    // only renders `answer` still tells the user what happened.
+    answer: succeeded ? answer : `I could not complete this request: ${failure}`,
+    plan,
+    trace: {
+      events: mapper?.seq ?? 0,
+      tool_calls: mapper?.toolCallCount ?? 0,
+      num_turns: Number(claudeResult?.num_turns || 0),
+    },
+    budget: {
+      steps_used: Number(claudeResult?.num_turns || 0),
+      tool_calls_used: mapper?.toolCallCount ?? 0,
+      elapsed_seconds: Math.round(durationMs) / 1000,
+      estimated_usd: Number(claudeResult?.total_cost_usd || 0),
+      timed_out: timedOut,
+    },
+    usage,
+    durationMs: Number(claudeResult?.duration_ms || durationMs) || durationMs,
+    model: resolveModel(claudeResult, initMessage),
+    sessionId: sessionId || claudeResult?.session_id || undefined,
+  };
+  if (!succeeded) result.error = failure;
+  if (warnings.length) result.warnings = warnings;
+  if (Array.isArray(claudeResult?.permission_denials) && claudeResult.permission_denials.length) {
+    result.permission_denials = claudeResult.permission_denials.map((d) => d?.tool_name).filter(Boolean);
+  }
+  return result;
+}

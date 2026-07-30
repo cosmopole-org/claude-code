@@ -1,7 +1,7 @@
 {
   "name": "@anthropic-ai/claude-code",
   "version": "0.0.0-leaked",
-  "description": "Anthropic Claude Code CLI — leaked source (2026-03-31). Not an official release.",
+  "description": "Anthropic Claude Code CLI \u2014 leaked source (2026-03-31). Not an official release.",
   "license": "UNLICENSED",
   "private": true,
   "type": "module",
@@ -20,7 +20,15 @@
     "lint": "biome check src/",
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
-    "check": "biome check src/ && tsc --noEmit"
+    "check": "biome check src/ && tsc --noEmit",
+    "caspar:deps": "node caspar/build/installDeps.mjs",
+    "caspar:build": "node caspar/build/buildCli.mjs",
+    "caspar:serve": "node caspar/runtime.mjs",
+    "check:caspar": "node caspar/tests/checks.mjs",
+    "check:caspar:cli": "node caspar/tests/live-cli.mjs",
+    "check:caspar:container": "node caspar/tests/container-check.mjs",
+    "check:caspar:llm": "node caspar/tests/llm-checks.mjs",
+    "check:caspar:provider": "node caspar/tests/live-provider.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",

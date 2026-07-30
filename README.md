@@ -40,6 +40,7 @@
 
 - [How It Leaked](#how-it-leaked)
 - [What Is Claude Code?](#what-is-claude-code)
+- [Run It as a Caspar Creature](#run-it-as-a-caspar-creature)
 - [Documentation](#-documentation)
 - [Explore with MCP Server](#-explore-with-mcp-server)
 - [Directory Structure](#directory-structure)
@@ -80,6 +81,32 @@ Claude Code is Anthropic's official CLI tool for interacting with Claude directl
 | **Runtime** | [Bun](https://bun.sh) |
 | **Terminal UI** | [React](https://react.dev) + [Ink](https://github.com/vadimdemedes/ink) |
 | **Scale** | ~1,900 files · 512,000+ lines of code |
+
+
+---
+
+## Run It as a Caspar Creature
+
+`caspar/` deploys this source as a **Caspar `docker` creature program entity** — an
+autonomous agent the Decillion platform prompts over Caspar's signaling API, in
+place of its davinci agent. The agent is the Claude Code source in this repo,
+compiled inside the creature image (`caspar/build/buildCli.mjs` completes the build
+this snapshot cannot: it installs the dependencies the tree imports without
+declaring, and stubs the modules the snapshot is missing).
+
+```bash
+node caspar/tests/checks.mjs                       # bridge checks (no node, no LLM)
+ANTHROPIC_API_KEY=… python3 scripts/deploy_claude_creature.py
+```
+
+Prompts arrive as `creatures/signal` packets, every step of the run is streamed
+back as `davinci/step`, and the answer is signalled as `davinci/result` — the same
+contract Decillion already speaks, so nothing changes in Caspar or in the platform.
+The space's own creatures (its cloud sandbox and any published tools) are exposed to
+the agent as MCP tools.
+
+See **[`caspar/README.md`](caspar/README.md)** for the architecture, the wire
+contract, deployment, and how to swap it in as Decillion's agent backbone.
 
 ---
 
