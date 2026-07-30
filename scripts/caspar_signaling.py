@@ -218,6 +218,32 @@ class CasparSignalingClient:
             time.sleep(poll)
         return False, logs
 
+    # -- ownership (mirrors /programs/deploy's authorization check) ----------
+    def list_programs(self, offset: int = 0, count: int = 100000) -> List[Dict[str, Any]]:
+        r = self.send("/programs/list", {"offset": offset, "count": count})
+        return r.get("machines", []) if isinstance(r, dict) else []
+
+    def get_creature(self, creature_id: str) -> Dict[str, Any]:
+        r = self.send("/creatures/get", {"userId": creature_id})
+        return r.get("creature", {}) if isinstance(r, dict) else {}
+
+    def program_owner(self, program_id: str) -> Optional[str]:
+        """The user id that owns the machine creature behind ``program_id``.
+
+        This is exactly what ``/programs/deploy`` checks before allowing a deploy
+        (program → machine_id → creature.owner_id === caller). Returns ``None``
+        when the program does not exist on the node, and ``""`` when its machine
+        has no recorded owner.
+        """
+        machine_id = ""
+        for program in self.list_programs():
+            if program.get("id") == program_id:
+                machine_id = program.get("machineId", "") or ""
+                break
+        if not machine_id:
+            return None
+        return self.get_creature(machine_id).get("ownerId", "")
+
     # -- signalling ----------------------------------------------------------
     def signal_entity_await(self, *, creature_id: str, program_id: str, entity_id: str,
                             envelope: Dict[str, Any], timeout: float = 300.0) -> Dict[str, Any]:

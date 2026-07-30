@@ -140,15 +140,48 @@ def main() -> int:
     client.login(DEPLOY_USER)
     ok(f"logged in as {DEPLOY_USER} (user_id={client.user_id})")
 
+    import os
+
     creature_id = ""
     prev_image_id = ""
+    reminted = False
     program_id = reuse_pid
+
+    # Ownership drift: a redeploy onto a program the deploy operator does not own
+    # is blocked by the node (`/programs/deploy` → "access to vm denied"). This
+    # happens when the recorded id is a leftover from a previous node era / a
+    # different admin. Detect it up front rather than failing on the deploy call.
+    if program_id:
+        owner = client.program_owner(program_id)
+        mine = client.user_id
+        if owner is None:
+            warn(f"recorded sandbox program {program_id} does not exist on the node — deploying a fresh one")
+            program_id = ""
+            reminted = True
+        elif owner and owner != mine:
+            if truthy(env_any("SANDBOX_REMINT_ON_DRIFT", default="0")):
+                warn(f"recorded sandbox program {program_id} is owned by {owner}, not the deploy operator ({mine}); "
+                     "re-minting a fresh operator-owned sandbox. Spaces re-adopt their Vercel sandbox by name, so no "
+                     "sandbox data is lost — but existing spaces keep pointing at the old creature until re-provisioned "
+                     "(POST /api/spaces/:id/sandbox).")
+                program_id = ""
+                reminted = True
+            else:
+                warn(f"recorded sandbox program {program_id} is owned by another account ({owner}), not the deploy "
+                     f"operator ({mine}). The node blocks redeploy onto a program you do not own, so this is SKIPPED — "
+                     "the existing sandbox creature keeps running and serving spaces (its image is functionally "
+                     "unchanged). Set SANDBOX_REMINT_ON_DRIFT=1 to mint a fresh operator-owned sandbox instead.")
+                # Report the existing ids unchanged so the manifest is preserved.
+                print("SANDBOX_TOOL_PROGRAM_ID=" + program_id, flush=True)
+                print("SANDBOX_TOOL_ENTITY_ID=" + entity_id, flush=True)
+                print("SANDBOX_SKIPPED=1", flush=True)
+                client.close()
+                return 0
+
     if program_id:
         info(f"redeploying the {TOOL_ID} entity onto existing program {program_id} — no new creature")
         prev_image_id = docker_image_id(program_id, entity_id)
     else:
-        import os
-
         suffix = os.urandom(4).hex()
         creature_id = client.create_machine_creature(f"m-tool-{TOOL_ID}-{suffix}")
         program_id = client.create_program(creature_id, f"/tools/{TOOL_ID}", "docker", f"tool {TOOL_ID}")
@@ -176,6 +209,10 @@ def main() -> int:
     print("SANDBOX_TOOL_PROGRAM_ID=" + program_id, flush=True)
     print("SANDBOX_TOOL_CREATURE_ID=" + creature_id, flush=True)
     print("SANDBOX_TOOL_ENTITY_ID=" + entity_id, flush=True)
+    # Signal a deliberate drift recovery so the CI accepts the new id instead of
+    # treating a changed sandbox program id as an orphaning bug.
+    if reminted:
+        print("SANDBOX_REMINTED=1", flush=True)
 
     # Start it as a long-lived serving creature: the tool runtime stays in its serve
     # loop and answers every signal over the gateway, so Nest's create/delete calls
