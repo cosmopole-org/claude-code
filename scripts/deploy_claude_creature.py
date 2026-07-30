@@ -42,7 +42,7 @@ Claude Code backbone (baked into the image; read from this environment only):
     ANTHROPIC_MODEL, CLAUDE_CREATURE_MODEL
 
 Agent build:
-    CLAUDE_CODE_CLI_SOURCE      source (default: compile this repo's src/) | npm
+    CLAUDE_CODE_CLI_SOURCE      npm (default: install the published CLI) | source (compile this repo's src/)
     CLAUDE_CREATURE_CLI_VERSION version the source-built CLI reports (default 2.0.0-caspar)
     CLAUDE_CODE_VERSION         published CLI version pin, npm mode only
 
@@ -209,10 +209,16 @@ def compose_dockerfile(files: Dict[str, str]) -> Tuple[bytes, str]:
 
     # Where the agent comes from. `source` (default) compiles this repo's Claude
     # Code source inside the image; `npm` installs the published CLI instead.
-    cli_source = env_any("CLAUDE_CODE_CLI_SOURCE", default="source").lower()
+    # Default to `npm` (install the published CLI): the from-source build (npm ci
+    # of the full dev tree + esbuild) is heavy enough to exhaust a constrained
+    # host and take the Caspar node down mid-build. The caspar/ bridge — where the
+    # creature's own logic lives — ships either way (it is copied, not compiled),
+    # so npm keeps the deploy light without losing local fixes. Set
+    # CLAUDE_CODE_CLI_SOURCE=source to compile this repo's src/ instead.
+    cli_source = env_any("CLAUDE_CODE_CLI_SOURCE", default="npm").lower()
     if cli_source not in ("source", "npm"):
-        warn(f"unknown CLAUDE_CODE_CLI_SOURCE={cli_source!r} — falling back to 'source'")
-        cli_source = "source"
+        warn(f"unknown CLAUDE_CODE_CLI_SOURCE={cli_source!r} — falling back to 'npm'")
+        cli_source = "npm"
     info(f"agent build mode: {cli_source}"
          + (" (compiling src/ inside the image)" if cli_source == "source" else " (installing the published CLI)"))
     dockerfile = dockerfile.replace(b"ARG CLAUDE_CODE_CLI_SOURCE=source",
