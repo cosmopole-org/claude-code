@@ -247,16 +247,21 @@ export function credentialSource(env) {
  * @returns `{ result, messages, exitCode, timedOut, stderr, argv, warnings }`
  */
 /**
- * The CLI's built-in shell + filesystem tools. In a Decillion space the agent must
- * not run commands or touch files on its own private, ephemeral container — that
- * work is invisible to the rest of the team and thrown away when the container
- * recycles. The space's shared cloud sandbox is the real machine, so when the
- * space has one these built-ins are turned OFF (`--disallowedTools`) and the agent
- * is forced to do all shell/filesystem work through the sandbox tool, where its
- * teammates see the same files and output.
+ * The CLI's built-in shell + filesystem tools. A Decillion agent must NOT run
+ * commands or touch files on its own private, ephemeral container — that work is
+ * invisible to the rest of the team and thrown away when the container recycles.
+ * All shell/filesystem work goes through the space's shared cloud sandbox instead,
+ * where teammates see the same files and output. So these built-ins are turned OFF
+ * (`--disallowedTools`) unconditionally — they must not even be a silent fallback.
+ *
+ * Planning, web and delegation tools (TodoWrite, EnterPlanMode/ExitPlanMode,
+ * WebSearch, WebFetch, Task, …) are deliberately NOT here — only shell + files.
  */
 export const DEFAULT_BUILTIN_FS_TOOLS = [
   "Bash",
+  "BashOutput",
+  "KillBash",
+  "KillShell",
   "Read",
   "Write",
   "Edit",
@@ -269,15 +274,16 @@ export const DEFAULT_BUILTIN_FS_TOOLS = [
 ];
 
 /**
- * Which built-in tools to deny for this run. Empty unless the space has a shared
- * execution environment (`hasSharedEnv`) — with no sandbox, denying the built-ins
- * would leave the agent unable to run anything at all. `CLAUDE_CREATURE_FORCE_SANDBOX_FS=0`
- * disables the behaviour; `CLAUDE_CREATURE_DISALLOWED_TOOLS` overrides the list.
+ * Which built-in tools to deny for this run — the shell + filesystem set, ALWAYS
+ * (the agent works on the space's sandbox, never its private container). Not gated
+ * on a sandbox being present: the user's requirement is that these are never a
+ * fallback. `CLAUDE_CREATURE_FORCE_SANDBOX_FS=0` turns the enforcement off entirely;
+ * `CLAUDE_CREATURE_DISALLOWED_TOOLS` overrides the exact list.
  */
-export function disallowedBuiltinTools({ hasSharedEnv, env = process.env } = {}) {
+export function disallowedBuiltinTools({ env = process.env } = {}) {
   const flag = env.CLAUDE_CREATURE_FORCE_SANDBOX_FS;
   const on = flag === undefined || String(flag).trim() === "" ? true : !["0", "false", "no", "off"].includes(String(flag).trim().toLowerCase());
-  if (!on || !hasSharedEnv) return [];
+  if (!on) return [];
   const override = (env.CLAUDE_CREATURE_DISALLOWED_TOOLS || "").trim();
   if (override) return override.split(",").map((s) => s.trim()).filter(Boolean);
   return [...DEFAULT_BUILTIN_FS_TOOLS];
