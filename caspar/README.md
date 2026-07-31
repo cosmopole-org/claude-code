@@ -92,8 +92,26 @@ files survive container restarts.
 On every prompt the agent is given the space's employable creatures — the project
 sandbox, published tools and apps, and the **other agents** — as real, callable
 MCP tools, and its system prompt enumerates them so it *plans with* them instead
-of only answering from its own knowledge. Sub-agents are offered for delegation:
+of only answering from its own knowledge or the generic editor/shell built-ins of
+the harness it runs on (asked "what tools do you have?", it answers with the
+space's tools, not `Read`/`Write`/`Bash`). Sub-agents are offered for delegation:
 the agent can hand a sub-task to another agent by calling it with a prose prompt.
+
+When the space has a **shared cloud sandbox** (the per-space machine Decillion
+publishes as a `category: "execution"` tool), the prompt names it as the space's
+shared filesystem + shell and tells the agent to collaborate THERE — so teammates
+see the same files and command output — rather than in its own private, ephemeral
+local working directory. Detection is by the published descriptor, not a hardcoded
+program id, so any execution-tool the space carries is framed this way.
+
+And it is not just advice: when a sandbox is present the CLI's **own built-in
+shell and filesystem tools are turned off** for the run (`--disallowedTools Bash,
+Read, Write, Edit, MultiEdit, NotebookEdit, NotebookRead, Glob, Grep, LS`), so the
+agent has no way to do throwaway work on its private container — bash and files
+*must* go through the shared sandbox, where the team sees them. It degrades safely:
+with no sandbox in the space the built-ins stay on (else the agent could run
+nothing). Knobs: `CLAUDE_CREATURE_FORCE_SANDBOX_FS=0` disables the enforcement,
+`CLAUDE_CREATURE_DISALLOWED_TOOLS` overrides the denied list.
 
 Two sources feed that catalog, unioned by `mergeCatalogs`:
 

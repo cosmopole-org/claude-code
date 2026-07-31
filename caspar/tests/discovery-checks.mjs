@@ -20,6 +20,7 @@
 import assert from "node:assert/strict";
 
 import { buildToolDefinitions, mergeCatalogs } from "../catalog.mjs";
+import { DEFAULT_BUILTIN_FS_TOOLS, disallowedBuiltinTools } from "../claudeRunner.mjs";
 import { discoverSpaceCatalog, entryFromDescriptor, extractDescriptor, resolveSpaceId } from "../discovery.mjs";
 import { bridgeFromEnv } from "../bridge.mjs";
 import { buildSystemPrompt, capabilitiesPreamble } from "../prompt.mjs";
@@ -141,9 +142,43 @@ async function main() {
     assert.ok(text.includes("sandbox"));
     assert.ok(/delegate/i.test(text));
     assert.ok(text.includes("Researcher"));
+    // it tells the model to answer capability questions with THESE, not built-ins
+    assert.ok(/not the generic editor\/shell built-ins/i.test(text));
     // it is included in the full system prompt
     const sys = buildSystemPrompt({ spaceId: "space-1" }, { capabilities: [{ name: "sandbox", description: "run code", kind: "tool" }] });
     assert.ok(sys.includes("sandbox"));
+  });
+
+  await check("shared sandbox reframes the agent's filesystem as the space's shared machine", () => {
+    const caps = [{ name: "sandbox", description: "run code", kind: "tool" }];
+    const withEnv = capabilitiesPreamble(caps, { sharedEnv: { name: "sandbox", description: "run code" } });
+    assert.ok(/SHARED WORKSPACE/i.test(withEnv));
+    assert.ok(/private scratch/i.test(withEnv), "it warns the local dir is private");
+    // no shared-env block when the space has no shared machine
+    const noEnv = capabilitiesPreamble(caps);
+    assert.ok(!/SHARED WORKSPACE/i.test(noEnv));
+    // the delivery section no longer tells the agent to work in its own local dir
+    const sys = buildSystemPrompt({ spaceId: "space-1" }, { capabilities: caps, sharedEnv: { name: "sandbox", description: "run code" } });
+    assert.ok(/shared machine/i.test(sys));
+  });
+
+  await check("built-in shell/fs tools are denied when a sandbox is present", () => {
+    // with a shared env, the built-in bash + filesystem tools are turned off
+    const denied = disallowedBuiltinTools({ hasSharedEnv: true, env: {} });
+    assert.deepEqual(denied, DEFAULT_BUILTIN_FS_TOOLS);
+    assert.ok(denied.includes("Bash") && denied.includes("Read") && denied.includes("Write"));
+    // never denied when the space has no sandbox (else the agent can do nothing)
+    assert.deepEqual(disallowedBuiltinTools({ hasSharedEnv: false, env: {} }), []);
+    // operator can disable the behaviour or override the list
+    assert.deepEqual(disallowedBuiltinTools({ hasSharedEnv: true, env: { CLAUDE_CREATURE_FORCE_SANDBOX_FS: "0" } }), []);
+    assert.deepEqual(disallowedBuiltinTools({ hasSharedEnv: true, env: { CLAUDE_CREATURE_DISALLOWED_TOOLS: "Bash, Foo" } }), ["Bash", "Foo"]);
+    // the prompt tells the model the built-ins are off, naming the sandbox
+    const sys = buildSystemPrompt(
+      { spaceId: "space-1" },
+      { capabilities: [{ name: "sandbox", description: "run code", kind: "tool" }], sharedEnv: { name: "sandbox", description: "run code" }, disabledBuiltins: denied },
+    );
+    assert.ok(/turned OFF/i.test(sys), "the prompt says the built-ins are off");
+    assert.ok(/`sandbox`/.test(sys), "…and points shell/file work at the sandbox tool");
   });
 
   // ── live fetch over the real gateway wire ──────────────────────────────────
