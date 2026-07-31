@@ -42,7 +42,9 @@ Claude Code backbone (baked into the image; read from this environment only):
     ANTHROPIC_MODEL, CLAUDE_CREATURE_MODEL
 
 Agent build:
-    CLAUDE_CODE_CLI_SOURCE      source (default: compile this repo's src/) | npm
+    CLAUDE_CODE_CLI_SOURCE      source (default: compile this repo's src/)
+                                | prebuilt (ship a CI-built dist/cli.mjs, no compile
+                                  on the node — caspar/Dockerfile.prebuilt) | npm
     CLAUDE_CREATURE_CLI_VERSION version the source-built CLI reports (default 2.0.0-caspar)
     CLAUDE_CODE_VERSION         published CLI version pin, npm mode only
 
@@ -95,6 +97,22 @@ from caspar_deploy_common import (  # noqa: E402
 from caspar_signaling import CasparSignalingClient  # noqa: E402
 
 ENTITY_ID = env_any("CLAUDE_ENTITY_ID", "DAVINCI_ENTITY_ID", default="davinci")
+
+# Where the agent's CLI comes from:
+#   source   (default) compile this repo's src/ inside the image;
+#   prebuilt          use a dist/cli.mjs already built in CI (the lightweight path:
+#                     the image build is a copy, not a compile — see
+#                     scripts/package-creature.sh and caspar/Dockerfile.prebuilt);
+#   npm               install the published CLI (a fallback, not the default).
+CLI_SOURCES = ("source", "prebuilt", "npm")
+
+
+def resolve_cli_source() -> str:
+    mode = env_any("CLAUDE_CODE_CLI_SOURCE", default="source").lower()
+    if mode not in CLI_SOURCES:
+        warn(f"unknown CLAUDE_CODE_CLI_SOURCE={mode!r} — falling back to 'source'")
+        mode = "source"
+    return mode
 
 # The backbone credentials + runtime knobs to bake into the image. Read from this
 # host's environment only — never written to the repo, never sent in a signal.
@@ -179,42 +197,67 @@ def bundle_tar_gz() -> bytes:
     ~9 MB, comfortably under the node's frame limit. `ADD bundle.tar.gz` unpacks it
     in the image.
     """
+    prebuilt = resolve_cli_source() == "prebuilt"
+    bundle = REPO / "dist" / "cli.mjs"
+    if prebuilt and not bundle.exists():
+        bad("CLAUDE_CODE_CLI_SOURCE=prebuilt, but dist/cli.mjs is not present. "
+            "Build it first (scripts/package-creature.sh), or download the CI artifact into dist/.")
+        raise SystemExit(2)
+
     buf = io.BytesIO()
     # mtime=0 keeps the gzip header (and therefore the context digest) stable.
     with tarfile.open(fileobj=buf, mode="w:gz", compresslevel=9) as tar:
         tar.gzip_mtime = 0  # type: ignore[attr-defined]  (documented no-op on old pythons)
-        for tree in CONTEXT_TREES:
-            root = REPO / tree
-            if not root.exists():
-                continue
-            for path in sorted(p for p in root.rglob("*") if p.is_file()):
-                tar.add(path, arcname=str(path.relative_to(REPO)), filter=_tar_filter)
-        for name in CONTEXT_FILES:
-            path = REPO / name
-            if path.exists():
-                tar.add(path, arcname=name, filter=_tar_filter)
-        # A CLI bundle already built on this host is shipped too, so the image can
-        # use it directly instead of rebuilding (and so an operator can deploy a
-        # locally-patched CLI).
-        bundle = REPO / "dist" / "cli.mjs"
-        if bundle.exists() and truthy(os.environ.get("CLAUDE_SHIP_LOCAL_BUNDLE", "0")):
-            info(f"shipping the locally built CLI bundle ({bundle.stat().st_size // 1024} KiB)")
+        if prebuilt:
+            # Lightweight context: only the prebuilt CLI and the signaling bridge —
+            # no src/, no manifests, nothing the image would compile. This is what
+            # caspar/Dockerfile.prebuilt unpacks and runs as-is.
+            info(f"shipping the prebuilt CLI bundle ({bundle.stat().st_size // 1024} KiB) — no source compile on the node")
             tar.add(bundle, arcname="dist/cli.mjs", filter=_tar_filter)
+            stubbed = REPO / "dist" / "stubbed-modules.json"
+            if stubbed.exists():
+                tar.add(stubbed, arcname="dist/stubbed-modules.json", filter=_tar_filter)
+            caspar_root = REPO / "caspar"
+            for path in sorted(p for p in caspar_root.rglob("*") if p.is_file()):
+                tar.add(path, arcname=str(path.relative_to(REPO)), filter=_tar_filter)
+        else:
+            for tree in CONTEXT_TREES:
+                root = REPO / tree
+                if not root.exists():
+                    continue
+                for path in sorted(p for p in root.rglob("*") if p.is_file()):
+                    tar.add(path, arcname=str(path.relative_to(REPO)), filter=_tar_filter)
+            for name in CONTEXT_FILES:
+                path = REPO / name
+                if path.exists():
+                    tar.add(path, arcname=name, filter=_tar_filter)
+            # A CLI bundle already built on this host is shipped too, so the image
+            # can use it directly instead of rebuilding (and so an operator can
+            # deploy a locally-patched CLI).
+            if bundle.exists() and truthy(os.environ.get("CLAUDE_SHIP_LOCAL_BUNDLE", "0")):
+                info(f"shipping the locally built CLI bundle ({bundle.stat().st_size // 1024} KiB)")
+                tar.add(bundle, arcname="dist/cli.mjs", filter=_tar_filter)
     return buf.getvalue()
 
 
 def compose_dockerfile(files: Dict[str, str]) -> Tuple[bytes, str]:
     """The image's Dockerfile: repo file + build mode + CA + baked env + label."""
-    dockerfile = (REPO / "caspar" / "Dockerfile").read_bytes()
-
     # Where the agent comes from. `source` (default) compiles this repo's Claude
-    # Code source inside the image; `npm` installs the published CLI instead.
-    cli_source = env_any("CLAUDE_CODE_CLI_SOURCE", default="source").lower()
-    if cli_source not in ("source", "npm"):
-        warn(f"unknown CLAUDE_CODE_CLI_SOURCE={cli_source!r} — falling back to 'source'")
-        cli_source = "source"
-    info(f"agent build mode: {cli_source}"
-         + (" (compiling src/ inside the image)" if cli_source == "source" else " (installing the published CLI)"))
+    # Code source inside the image; `prebuilt` copies in a CI-built dist/cli.mjs
+    # (no compile — caspar/Dockerfile.prebuilt); `npm` installs the published CLI.
+    cli_source = resolve_cli_source()
+    mode_blurb = {
+        "source": " (compiling src/ inside the image)",
+        "prebuilt": " (copying in the CI-built dist/cli.mjs — no compile on the node)",
+        "npm": " (installing the published CLI)",
+    }[cli_source]
+    info(f"agent build mode: {cli_source}{mode_blurb}")
+
+    dockerfile_name = "Dockerfile.prebuilt" if cli_source == "prebuilt" else "Dockerfile"
+    dockerfile = (REPO / "caspar" / dockerfile_name).read_bytes()
+
+    # These substitutions apply to caspar/Dockerfile (source/npm); Dockerfile.prebuilt
+    # has no such ARG lines, so the replaces are no-ops there — harmless.
     dockerfile = dockerfile.replace(b"ARG CLAUDE_CODE_CLI_SOURCE=source",
                                     f"ARG CLAUDE_CODE_CLI_SOURCE={cli_source}".encode())
 

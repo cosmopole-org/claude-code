@@ -1,0 +1,73 @@
+# Claude Code Caspar creature image — PREBUILT (lightweight) variant.
+#
+# Same runtime as caspar/Dockerfile, but with the heavy step removed: the CLI is
+# NOT compiled here. It is compiled once, in CI (scripts/package-creature.sh →
+# .github/workflows/build-claude-binaries.yml), and shipped in as a prebuilt
+# `bundle.tar.gz` (dist/cli.mjs + the caspar/ signaling bridge). This image just
+# unpacks it — so the node-side build (or a `docker build`) is a copy, not a
+# TypeScript/esbuild compile, and never touches the npm registry.
+#
+#   bundle.tar.gz  ──(built in CI from THIS repo's src/, not the published npm CLI)
+#        │
+#        ▼  ADD (unpacked into /app)
+#   /app/dist/cli.mjs   +   /app/caspar/**   ──▶  node /app/caspar/runtime.mjs
+#
+# Build context: a directory (or Caspar deploy payload) whose only required file is
+# `bundle.tar.gz`, laid out with `dist/` and `caspar/` at its root — exactly what
+# scripts/package-creature.sh emits.
+#
+#   docker build -f caspar/Dockerfile.prebuilt -t claude-code-creature <context-with-bundle.tar.gz>
+#
+# The ECR mirror of the official node image avoids Docker Hub anonymous-pull rate
+# limits during node-side builds (same reason caspar/Dockerfile uses it).
+
+FROM public.ecr.aws/docker/library/node:22-bookworm-slim
+
+# git: the agent works in a real repo-shaped workspace.
+# ripgrep: the CLI's Grep tool.
+# ca-certificates: outbound TLS (the Anthropic API, and the node's egress gateway).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ripgrep ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# >>> caspar-ca <<<
+# (the deployer substitutes the host CA bundle here when it has one — an
+# intercepting egress proxy would otherwise break outbound TLS)
+
+# The prebuilt payload: dist/cli.mjs (+ stubbed-modules.json) and the caspar/
+# bridge, at the archive root, so this unpacks straight into /app/dist + /app/caspar.
+ADD bundle.tar.gz /app
+
+# Fail the build loudly if the prebuilt bundle is missing or does not load —
+# better here, where the build log shows it, than on the first prompt an agent
+# receives. (`--version` boots the whole CLI, so a broken bundle cannot pass.)
+RUN test -f /app/dist/cli.mjs \
+    && node /app/dist/cli.mjs --version
+
+# The node uploads runtime inputs to /app/input before starting the container; the
+# directory must exist for the upload (and the container start) to succeed. /data is
+# the VM's persistent mount — session workspaces live there so a conversation's
+# files survive a container restart.
+RUN mkdir -p /app/input /data/workspaces \
+    && useradd --create-home --shell /bin/bash claude \
+    && chown -R claude:claude /app /data
+
+# Claude Code refuses to bypass permission prompts as root, and an autonomous agent
+# has no human to approve them — so the creature runs unprivileged.
+USER claude
+ENV HOME=/home/claude \
+    NODE_ENV=production \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    DISABLE_AUTOUPDATER=1 \
+    CLAUDE_CODE_BIN=/app/dist/cli.mjs \
+    CLAUDE_CREATURE_INPUT_DIR=/app/input \
+    CLAUDE_CREATURE_WORKSPACE_ROOT=/data/workspaces \
+    CLAUDE_CREATURE_CONFIG_DIR=/data/claude-config \
+    CLAUDE_CREATURE_PERMISSION_MODE=bypassPermissions
+
+# Serve prompts over the signaling API (the gateway path). With no gateway env
+# injected, the same entrypoint answers one task from /app/input and exits — the
+# offline self-test.
+CMD ["node", "/app/caspar/runtime.mjs"]

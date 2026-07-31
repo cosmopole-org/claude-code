@@ -126,6 +126,31 @@ The creature image does exactly this (`build/imageBuild.sh`) and fails the build
 the bundle cannot report its version. `CLAUDE_CODE_CLI_SOURCE=npm` at deploy time
 installs the published CLI instead — a fallback, not the default.
 
+### Pre-building the binaries in CI (the lightweight deploy path)
+
+Compiling `src/` inside the image is the slow part of a deploy. You can do it
+**once, in CI**, and then deploy a copy — no compiler, no npm registry on the node:
+
+* **`scripts/package-creature.sh`** runs the build above and packages the result
+  into `out/bundle.tar.gz` — `dist/cli.mjs` plus the `caspar/` bridge, laid out so
+  it is a ready-to-use Docker build context — alongside the raw `cli.mjs` and a
+  `manifest.json` (version, git sha, sizes).
+* **`.github/workflows/build-claude-binaries.yml`** does this on every push (and on
+  `v*` tags / manual dispatch) and publishes the bundle three ways: a workflow
+  **artifact**, a **GitHub Release** (on a tag), and a **prebuilt image** pushed to
+  `ghcr.io/<owner>/claude-code-creature`.
+* **`caspar/Dockerfile.prebuilt`** is the lightweight image: it `ADD`s the prebuilt
+  `bundle.tar.gz` and runs it — the whole build is a copy plus a `--version`
+  smoke-test, no `bun install`, no esbuild.
+* **`CLAUDE_CODE_CLI_SOURCE=prebuilt`** wires this into the normal deployer (below):
+  it ships only `dist/cli.mjs` + `caspar/` and builds `Dockerfile.prebuilt`, so the
+  node-side build recompiles nothing. Build (or download) the bundle into `dist/`
+  first — the deployer refuses prebuilt mode without it.
+
+So the two deploy shapes are: **pull the GHCR image** and run it as the creature,
+or **`CLAUDE_CODE_CLI_SOURCE=prebuilt python3 scripts/deploy_claude_creature.py`**
+after dropping the CI-built `dist/cli.mjs` in place.
+
 ---
 
 ## Deploying
@@ -154,7 +179,7 @@ Key knobs (all documented in the script's header):
 | `CLAUDE_ENTITY_ID` | Entity id, default `davinci` (existing proxies target that entity) |
 | `CASPAR_DEPLOY_USER` | Deploy operator, default `davinci_admin` — must own the program being reused |
 | `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_BASE_URL` | The backbone, baked into the image |
-| `CLAUDE_CODE_CLI_SOURCE` | `source` (default) or `npm` |
+| `CLAUDE_CODE_CLI_SOURCE` | `source` (default, compile `src/`), `prebuilt` (copy a CI-built `dist/cli.mjs`, no compile), or `npm` |
 | `CLAUDE_VM_RAM_MB` / `_DISK_GB` / `_CPUS` / `_MAX_SECONDS` | VM resources (defaults 2048 MB / 8 GB / 2 cpu / unlimited) |
 
 ### Replacing davinci in Decillion, with zero Decillion changes
