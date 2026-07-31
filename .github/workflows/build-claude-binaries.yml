@@ -1,0 +1,207 @@
+# ─────────────────────────────────────────────────────────────
+# build-claude-binaries — pre-build the Claude Code creature binaries
+# ─────────────────────────────────────────────────────────────
+# Compiles the CLI **from this repository's own src/** (never the npm package
+# Anthropic publishes) into a single self-contained dist/cli.mjs, packages it with
+# the caspar/ signaling bridge into a portable bundle, and publishes it three ways:
+#
+#   1. workflow artifact       — bundle.tar.gz + cli.mjs + manifest.json
+#   2. GitHub Release assets    — on a v* tag (or a manual run with make_release)
+#   3. prebuilt container image — pushed to GHCR (ghcr.io/<owner>/claude-code-creature)
+#
+# The point is to do the heavy build ONCE, here, so the later Caspar deploy is
+# lightweight: it either pulls the prebuilt image, or feeds bundle.tar.gz to
+# `scripts/deploy_claude_creature.py` with CLAUDE_CODE_CLI_SOURCE=prebuilt — in
+# which the node's image build is a copy, not a compile, and touches no registry.
+# ─────────────────────────────────────────────────────────────
+name: build-claude-binaries
+
+on:
+  push:
+    branches:
+      - main
+      - "claude/**"
+    tags:
+      - "v*"
+    paths:
+      - "src/**"
+      - "caspar/**"
+      - "scripts/**"
+      - "package.json"
+      - "bun.lock"
+      - "tsconfig.json"
+      - "biome.json"
+      - ".github/workflows/build-claude-binaries.yml"
+  workflow_dispatch:
+    inputs:
+      cli_version:
+        description: "Version the built CLI reports (semver, not starting with 0). Blank → 2.0.0-caspar."
+        required: false
+        type: string
+      push_image:
+        description: "Build and push the prebuilt image to GHCR."
+        required: false
+        type: boolean
+        default: true
+      make_release:
+        description: "Attach the bundle to a GitHub Release (always on for v* tags)."
+        required: false
+        type: boolean
+        default: false
+
+# Least privilege: read the repo, write Releases, write GHCR packages.
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build-claude-binaries-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── 1) Build the CLI from source and package the portable bundle ───────────
+  bundle:
+    runs-on: ubuntu-latest
+    outputs:
+      cli_version: ${{ steps.version.outputs.cli_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.1.0"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Determine CLI version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.cli_version }}" ]; then
+            V="${{ inputs.cli_version }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            V="${GITHUB_REF#refs/tags/}"; V="${V#v}"
+          else
+            V="2.0.0-caspar"
+          fi
+          echo "cli_version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building CLI version: $V"
+
+      - name: Build + package the creature bundle (from src/, not npm)
+        env:
+          CLAUDE_CREATURE_CLI_VERSION: ${{ steps.version.outputs.cli_version }}
+          OUT_DIR: out
+        run: bash scripts/package-creature.sh
+
+      - name: Show manifest
+        run: cat out/manifest.json
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-code-creature-bundle
+          path: |
+            out/bundle.tar.gz
+            out/cli.mjs
+            out/stubbed-modules.json
+            out/manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.make_release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('binaries-{0}', github.sha) }}
+          name: Claude Code creature ${{ steps.version.outputs.cli_version }}
+          body: |
+            Pre-built Claude Code creature binaries, compiled from this repository's
+            `src/` (not the published npm package).
+
+            - `bundle.tar.gz` — portable build context (`dist/cli.mjs` + `caspar/` bridge).
+              Deploy lightweight with `CLAUDE_CODE_CLI_SOURCE=prebuilt`, or build
+              `caspar/Dockerfile.prebuilt` against it.
+            - `cli.mjs` — the raw built CLI (`node cli.mjs --version`).
+            - `manifest.json` — version, git sha, sizes.
+
+            Prebuilt image: `ghcr.io/${{ github.repository_owner }}/claude-code-creature`
+          files: |
+            out/bundle.tar.gz
+            out/cli.mjs
+            out/stubbed-modules.json
+            out/manifest.json
+          fail_on_unmatched_files: true
+
+  # ── 2) Build the prebuilt runtime image and push it to GHCR ────────────────
+  image:
+    needs: bundle
+    runs-on: ubuntu-latest
+    # Push by default; a manual run can opt out with push_image=false.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+    steps:
+      - name: Checkout (for caspar/Dockerfile.prebuilt)
+        uses: actions/checkout@v4
+
+      - name: Download the prebuilt bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: claude-code-creature-bundle
+          path: out
+
+      - name: Assemble the docker build context
+        run: |
+          mkdir -p context
+          cp out/bundle.tar.gz context/bundle.tar.gz
+          cp caspar/Dockerfile.prebuilt context/Dockerfile.prebuilt
+          ls -lh context
+
+      - name: Lowercase the image name
+        id: img
+        run: echo "name=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/claude-code-creature" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.bundle.outputs.cli_version }}
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=tag
+
+      - name: Build and push the prebuilt creature image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./context
+          file: ./context/Dockerfile.prebuilt
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### Prebuilt Claude Code creature image"
+            echo ""
+            echo "Pushed tags:"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
