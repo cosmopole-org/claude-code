@@ -47,12 +47,22 @@ if [ -z "$PKG_MANAGER" ]; then
   if command -v bun >/dev/null 2>&1; then PKG_MANAGER=bun; else PKG_MANAGER=npm; fi
 fi
 
+# Skip dependency install/build scripts — the node-gyp build of node-pty in
+# particular. The creature build needs NO compiled native addon: esbuild ships its
+# own per-platform binary (installed as a package, not built), and the runtime
+# image carries no node_modules for a native addon to load at runtime anyway. So
+# building them here is wasted work that also FAILS on a host without a C toolchain
+# (e.g. the EC2 deploy host: "gyp ERR! stack Error: not found: make"), which would
+# abort the whole prebuild. Exported so the child npm in installDeps.mjs inherits
+# it too. (The in-image `source` build does not set this and still builds normally.)
+export npm_config_ignore_scripts=true
+
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-  log "installing declared dependencies with $PKG_MANAGER"
+  log "installing declared dependencies with $PKG_MANAGER (native build scripts skipped)"
   if [ "$PKG_MANAGER" = "bun" ]; then
-    bun install --frozen-lockfile 2>/dev/null || bun install
+    bun install --ignore-scripts --frozen-lockfile 2>/dev/null || bun install --ignore-scripts
   else
-    npm ci --no-fund --no-audit --loglevel=error 2>/dev/null || npm install --no-fund --no-audit --loglevel=error
+    npm ci --ignore-scripts --no-fund --no-audit --loglevel=error 2>/dev/null || npm install --ignore-scripts --no-fund --no-audit --loglevel=error
   fi
 
   log "installing the dependencies this snapshot imports but does not declare"
