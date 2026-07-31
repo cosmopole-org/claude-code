@@ -113,6 +113,17 @@ with no sandbox in the space the built-ins stay on (else the agent could run
 nothing). Knobs: `CLAUDE_CREATURE_FORCE_SANDBOX_FS=0` disables the enforcement,
 `CLAUDE_CREATURE_DISALLOWED_TOOLS` overrides the denied list.
 
+**Which space is authoritative.** The space a run is scoped to is decided by the
+**store the signal came from**, not by a client-supplied field. The backend signals
+an agent *within* its space store, the node stamps that store onto the signal
+envelope (`store.id`) and the proxy relay carries it through untouched, so
+`decodeTaskSignal` (`taskSignal.mjs`, `spaceIdFromEnvelope`) reads it and sets the
+task's `spaceId` from it — overriding any `spaceId` a caller embedded in the payload.
+This is what discovery (`resolveSpaceId`) and the thread/session key scope to, so an
+agent can neither be handed the wrong space nor reach another space's creatures by
+naming a different id. A signal with no store on its envelope falls back to whatever
+the payload provided (and then the `session:<spaceId>:…` shape).
+
 Two sources feed that catalog, unioned by `mergeCatalogs`:
 
 1. **`config.tools`** — the catalog the backend's `DiscoveryService` sends with the
