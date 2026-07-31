@@ -34,6 +34,7 @@ import path from "node:path";
 import { bridgeFromEnv } from "../bridge.mjs";
 import { buildToolDefinitions, mergeArgs } from "../catalog.mjs";
 import { applyLlmOverride, buildChildEnv } from "../claudeRunner.mjs";
+import { resolveSpaceId } from "../discovery.mjs";
 import { TrajectoryMapper } from "../events.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "../prompt.mjs";
 import { normalizeUsage } from "../result.mjs";
@@ -72,7 +73,7 @@ function tempDir(prefix) {
 }
 
 /** A prompt exactly as the Decillion backend + node proxy deliver it. */
-function proxyDelivery({ prompt = "What is the status of the deploy?", skill = "You are Tina, the release manager.", tools = [], history = [], correlationId = "corr-1", streamTo = "9@global", replyTo = "8@global", extra = {} } = {}) {
+function proxyDelivery({ prompt = "What is the status of the deploy?", skill = "You are Tina, the release manager.", tools = [], history = [], correlationId = "corr-1", streamTo = "9@global", replyTo = "8@global", extra = {}, store = undefined } = {}) {
   const inner = {
     prompt,
     objective: prompt,
@@ -96,7 +97,11 @@ function proxyDelivery({ prompt = "What is the status of the deploy?", skill = "
     proxyProgramId: replyTo,
     proxyEntityId: "agent",
   };
-  return { key: "creatures/signal", data: { user: { id: replyTo }, action: "single", entityId: "davinci", correlationId, data: JSON.stringify(inner) } };
+  const envelope = { user: { id: replyTo }, action: "single", entityId: "davinci", correlationId, data: JSON.stringify(inner) };
+  // The node stamps the originating store on the envelope (`store.id`); the
+  // proxy relay carries it through untouched. Present only when the caller asks.
+  if (store !== undefined) envelope.store = store;
+  return { key: "creatures/signal", data: envelope };
 }
 
 function scenarioFile(scenario) {
@@ -162,6 +167,23 @@ await check("signals that are not prompts are ignored", () => {
   assert.equal(decodeTaskSignal("creatures/signal", { data: JSON.stringify({ kind: "davinci/step", correlationId: "x" }) }), null);
   assert.equal(decodeTaskSignal("other/key", { data: "{}" }), null);
   assert.equal(decodeTaskSignal("creatures/signal", { data: "not json" }), null);
+});
+
+await check("the store the signal came from is the authoritative space, overriding the payload", () => {
+  // The requester embeds spaceId "space-1" in the payload, but the node stamps
+  // the real originating store on the envelope — that store is what the creature
+  // must scope to, so a payload spaceId can neither override nor forge it.
+  const { key, data } = proxyDelivery({ store: { id: "store-real" } });
+  const decoded = decodeTaskSignal(key, data);
+  assert.equal(decoded.task.spaceId, "store-real", "the envelope store overrides the client spaceId");
+  assert.equal(resolveSpaceId(decoded.task), "store-real", "discovery scopes to the store, not the payload");
+  // A flat `storeId` on the envelope is accepted as a fallback.
+  const flat = proxyDelivery({ store: undefined });
+  flat.data.storeId = "store-flat";
+  assert.equal(decodeTaskSignal(flat.key, flat.data).task.spaceId, "store-flat");
+  // With no store on the envelope, the payload's own spaceId is kept.
+  const bare = proxyDelivery();
+  assert.equal(decodeTaskSignal(bare.key, bare.data).task.spaceId, "space-1");
 });
 
 await check("the system prompt carries the persona and the group-chat protocol", () => {

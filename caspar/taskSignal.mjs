@@ -40,6 +40,29 @@ function parseMaybeJson(value) {
 }
 
 /**
+ * The authoritative space (Caspar store) id for a signal: the store the node
+ * says the signal was sent *within*.
+ *
+ * The node resolves the originating store from the signal's own context and
+ * stamps it on the `StoresSend` envelope (`store.id`) it pushes to us — carried
+ * through the proxy relay untouched — so the creature never has to trust a
+ * client-supplied `spaceId`. Which store the signal actually came from is what
+ * scopes in-space tool/sub-agent discovery, and it cannot be forged by a caller.
+ * A flat `storeId` is accepted as a fallback. Empty when the envelope carries no
+ * store (a signal not scoped to a space), in which case the caller keeps
+ * whatever the payload provided.
+ */
+export function spaceIdFromEnvelope(envelope) {
+  if (!envelope || typeof envelope !== "object") return "";
+  const store = envelope.store;
+  if (store && typeof store === "object" && typeof store.id === "string" && store.id.trim()) {
+    return store.id.trim();
+  }
+  if (typeof envelope.storeId === "string" && envelope.storeId.trim()) return envelope.storeId.trim();
+  return "";
+}
+
+/**
  * Decode one pushed `creatures/signal` into a task, or `null` when the signal is
  * not a task delivery (a tool result, an unrelated push, …).
  *
@@ -72,6 +95,13 @@ export function decodeTaskSignal(key, data) {
     typeof inner.prompt === "string" ||
     typeof inner.skill === "string";
   if (!isTask) return null;
+
+  // The space is decided by the store the signal came from, not by the client:
+  // the node stamps the originating store on the envelope, so this is the id the
+  // rest of the Claude Code mechanism (discovery, thread/session key) scopes to.
+  // It overrides any `spaceId` the requester embedded in the payload.
+  const envelopeSpaceId = spaceIdFromEnvelope(data);
+  if (envelopeSpaceId) inner.spaceId = envelopeSpaceId;
 
   const replyTo = inner.reply_to || inner.replyTo || data.user?.id || "";
   const correlationId = inner.correlationId || data.correlationId || "";
