@@ -93,6 +93,13 @@ class CasparBridgeClient:
         self._pending_lock = threading.Lock()
         self._partials: Dict[int, Dict[str, Any]] = {}
         self._signal_handler: Optional[SignalHandler] = None
+        # Signals that arrive before a handler is registered are buffered and
+        # replayed on registration. The node flushes packets it queued while the
+        # container was cold immediately after WELCOME, and the reader thread can
+        # deliver those before the serve loop calls ``on_signal`` — without this
+        # buffer they would be dropped and the caller would hang.
+        self._early_signals: list = []
+        self._early_signals_cap = 512
         self._reader: Optional[threading.Thread] = None
         self._closed = threading.Event()
         self.session_id: Optional[int] = None
@@ -147,8 +154,21 @@ class CasparBridgeClient:
     # -- signal handling ----------------------------------------------------
     def on_signal(self, handler: SignalHandler) -> None:
         """Register a callback invoked (on the reader thread) for each pushed
-        signal as ``handler(key, data)``."""
-        self._signal_handler = handler
+        signal as ``handler(key, data)``.
+
+        Any signals that arrived before now (buffered by the reader thread) are
+        replayed to the handler in order, so a flush that races registration is
+        never lost.
+        """
+        with self._pending_lock:
+            self._signal_handler = handler
+            buffered = self._early_signals
+            self._early_signals = []
+        for key, data in buffered:
+            try:
+                handler(key, data)
+            except Exception:  # noqa: BLE001 — a bad handler must not kill startup
+                pass
 
     # -- host calls ---------------------------------------------------------
     def call(self, op: str, input: Optional[Dict[str, Any]] = None, *, timeout: Optional[float] = None) -> Any:
@@ -315,12 +335,24 @@ class CasparBridgeClient:
         if opcode in (OP_RESPONSE, OP_WELCOME, OP_PONG, OP_ERROR):
             self._complete(corr, value)
         elif opcode == OP_SIGNAL:
+            if not isinstance(value, dict):
+                return
+            key, data = value.get("key", ""), value.get("data")
             handler = self._signal_handler
-            if handler is not None and isinstance(value, dict):
-                try:
-                    handler(value.get("key", ""), value.get("data"))
-                except Exception:  # noqa: BLE001 — a bad handler must not kill the reader
-                    pass
+            if handler is None:
+                # No handler yet: buffer for replay when one registers, so a flush
+                # that arrives in the same batch as WELCOME is not dropped. Bounded
+                # so a misbehaving peer cannot grow it without limit.
+                with self._pending_lock:
+                    if self._signal_handler is None:
+                        if len(self._early_signals) < self._early_signals_cap:
+                            self._early_signals.append((key, data))
+                        return
+                    handler = self._signal_handler
+            try:
+                handler(key, data)
+            except Exception:  # noqa: BLE001 — a bad handler must not kill the reader
+                pass
 
 
 def bridge_from_env(*, connect: bool = True, timeout: float = 60.0) -> Optional[CasparBridgeClient]:

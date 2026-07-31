@@ -97,6 +97,13 @@ export class CasparBridgeClient {
     this._pending = new Map(); // corrId -> {resolve, timer}
     this._partials = new Map(); // msgId -> {total, chunks, op, corr}
     this._listeners = new Set();
+    // Signals received before any listener is registered are buffered here and
+    // replayed to the first listener. The node flushes packets it queued while
+    // the container was cold right after WELCOME, and those can be read in the
+    // same batch — before the serve loop subscribes — so without this they would
+    // be dropped and the caller would hang.
+    this._earlySignals = [];
+    this._earlySignalsCap = 512;
     this._buffer = Buffer.alloc(0);
     this._closed = false;
   }
@@ -160,7 +167,21 @@ export class CasparBridgeClient {
    * without overwriting each other.
    */
   onSignal(listener) {
+    const wasEmpty = this._listeners.size === 0;
     this._listeners.add(listener);
+    // Replay anything that arrived before a listener existed, in order, to the
+    // listener that just registered.
+    if (wasEmpty && this._earlySignals.length) {
+      const buffered = this._earlySignals;
+      this._earlySignals = [];
+      for (const [key, data] of buffered) {
+        try {
+          listener(key, data);
+        } catch {
+          // A broken listener must never break replay.
+        }
+      }
+    }
     return () => this._listeners.delete(listener);
   }
 
@@ -312,9 +333,17 @@ export class CasparBridgeClient {
       return;
     }
     if (opcode === OP_SIGNAL && value && typeof value === "object") {
+      const key = value.key ?? "";
+      const data = value.data;
+      if (this._listeners.size === 0) {
+        // No listener yet: buffer for replay on the first `onSignal`, bounded so a
+        // misbehaving peer cannot grow it without limit.
+        if (this._earlySignals.length < this._earlySignalsCap) this._earlySignals.push([key, data]);
+        return;
+      }
       for (const listener of [...this._listeners]) {
         try {
-          listener(value.key ?? "", value.data);
+          listener(key, data);
         } catch {
           // A broken listener must never kill the read path.
         }
