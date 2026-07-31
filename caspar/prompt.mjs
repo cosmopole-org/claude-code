@@ -193,6 +193,22 @@ export function buildSystemPrompt(task, opts = {}) {
   const capabilities = capabilitiesPreamble(opts.capabilities, { sharedEnv: opts.sharedEnv, disabledBuiltins: opts.disabledBuiltins });
   if (capabilities) parts.push(capabilities);
 
+  // When the shell/filesystem built-ins are disabled but the capabilities section
+  // did not already explain it (no shared sandbox named there), state it plainly so
+  // the model does not try — and get denied by — a local command or file edit.
+  const disabled = Array.isArray(opts.disabledBuiltins) ? opts.disabledBuiltins.filter(Boolean) : [];
+  if (disabled.length && !(capabilities && opts.sharedEnv && opts.sharedEnv.name)) {
+    parts.push(
+      "=== NO LOCAL SHELL OR FILESYSTEM ===\n" +
+        "Your engine's built-in shell and file tools are DISABLED here. Do not try to " +
+        "run local commands or read/write local files — those tools are gone on purpose. " +
+        "Any command or file operation must go through this space's sandbox tool (a tool " +
+        "under the `caspar` MCP server). If no sandbox tool is available to you, say so " +
+        "plainly and ask for it to be attached — never claim to have run something you could not.\n" +
+        "=== END ===\n",
+    );
+  }
+
   const skill = typeof task.skill === "string" && task.skill.trim() ? task.skill.trim() : typeof task.systemInstruction === "string" ? task.systemInstruction.trim() : "";
   if (skill) {
     parts.push(

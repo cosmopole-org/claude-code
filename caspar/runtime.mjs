@@ -199,10 +199,10 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     return category === "execution" || /sandbox/.test(name);
   });
   const sharedEnv = sharedEnvDef ? { name: sharedEnvDef.name, description: sharedEnvDef.description } : undefined;
-  // Force shell + filesystem work onto the shared sandbox: with a sandbox present,
-  // the CLI's own Bash/Read/Write/… built-ins are turned off, so the agent cannot
+  // Force shell + filesystem work onto the shared sandbox: the CLI's own
+  // Bash/Read/Write/… built-ins are turned off unconditionally, so the agent cannot
   // do throwaway work on its private container that its teammates never see.
-  const disallowedTools = disallowedBuiltinTools({ hasSharedEnv: Boolean(sharedEnv) });
+  const disallowedTools = disallowedBuiltinTools();
   const systemPrompt = buildSystemPrompt(task, { capabilities, sharedEnv, disabledBuiltins: disallowedTools });
   const prompt = buildUserPrompt(task, { objective, attachments, workspace });
   const maxWallSeconds = Number(config.max_wall_seconds || process.env.CLAUDE_CREATURE_MAX_WALL_SECONDS || 900);
