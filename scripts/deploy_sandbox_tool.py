@@ -140,31 +140,65 @@ def main() -> int:
     client.login(DEPLOY_USER)
     ok(f"logged in as {DEPLOY_USER} (user_id={client.user_id})")
 
+    import os
+
+    def mint_creature() -> "tuple[str, str]":
+        """Mint a fresh machine creature + docker program owned by THIS login."""
+        suffix = os.urandom(4).hex()
+        cid = client.create_machine_creature(f"m-tool-{TOOL_ID}-{suffix}")
+        pid = client.create_program(cid, f"/tools/{TOOL_ID}", "docker", f"tool {TOOL_ID}")
+        info(f"created machine creature {cid} and program {pid}")
+        return cid, pid
+
     creature_id = ""
     prev_image_id = ""
+    reminted = False
     program_id = reuse_pid
     if program_id:
         info(f"redeploying the {TOOL_ID} entity onto existing program {program_id} — no new creature")
         prev_image_id = docker_image_id(program_id, entity_id)
     else:
-        import os
-
-        suffix = os.urandom(4).hex()
-        creature_id = client.create_machine_creature(f"m-tool-{TOOL_ID}-{suffix}")
-        program_id = client.create_program(creature_id, f"/tools/{TOOL_ID}", "docker", f"tool {TOOL_ID}")
-        info(f"created machine creature {creature_id} and program {program_id}")
+        creature_id, program_id = mint_creature()
 
     files = build_context()
     dockerfile, digest = compose_dockerfile(files)
     already_current = bool(prev_image_id) and docker_image_context(program_id, entity_id) == digest
 
-    try:
-        client.deploy(program_id, entity_id, "docker", b64_bytes(dockerfile), files_b64=files,
+    def push(pid: str) -> None:
+        client.deploy(pid, entity_id, "docker", b64_bytes(dockerfile), files_b64=files,
                       metadata={"decillion": descriptor()})
+
+    try:
+        push(program_id)
     except Exception as exc:  # noqa: BLE001
-        bad(f"deploy failed: {exc}")
-        client.close()
-        return 1
+        # Owner drift: the recorded program was minted by a DIFFERENT identity (an
+        # e2e run / an earlier operator), so the node refuses this login deploy
+        # onto it ("access to vm denied"). Re-mint ONCE onto a fresh login-owned
+        # program and carry on — the Nest deployer hits the same wall and resolves
+        # it the same way (server deployer.ts operatorOwnsProgram → re-mint).
+        #
+        # This is emphatically NOT a per-run mint: CI records the new id in the
+        # manifest, so the NEXT deploy reuses it, this login owns it, the redeploy
+        # succeeds, and no further creature is ever minted. A fresh creature is
+        # created only on the single deploy that discovers the drift.
+        denied = "access to vm denied" in str(exc) or "denied" in str(exc).lower()
+        if reuse_pid and denied:
+            warn(f"redeploy onto {reuse_pid} refused (owner drift): {exc}")
+            warn("re-minting a fresh login-owned sandbox program ONCE and rebinding to it")
+            creature_id, program_id = mint_creature()
+            prev_image_id = ""
+            already_current = False
+            reminted = True
+            try:
+                push(program_id)
+            except Exception as exc2:  # noqa: BLE001
+                bad(f"deploy failed after re-mint: {exc2}")
+                client.close()
+                return 1
+        else:
+            bad(f"deploy failed: {exc}")
+            client.close()
+            return 1
 
     if already_current:
         ok("image already built from this exact context — no rebuild to wait for")
@@ -173,6 +207,12 @@ def main() -> int:
                        prev_image_id=prev_image_id, expect_context=digest)
     ok(f"{TOOL_ID} creature deployed: program={program_id} entity={entity_id}")
 
+    if reminted:
+        # CI keys on this marker to adopt the new id in place of the reuse target
+        # instead of failing the deploy (its normal "reuse must not change id" guard).
+        warn(f"sandbox program re-minted due to owner drift: {reuse_pid} → {program_id} "
+             "(CI records the new id; existing spaces rebind from the manifest)")
+        print("SANDBOX_TOOL_REMINTED=1", flush=True)
     print("SANDBOX_TOOL_PROGRAM_ID=" + program_id, flush=True)
     print("SANDBOX_TOOL_CREATURE_ID=" + creature_id, flush=True)
     print("SANDBOX_TOOL_ENTITY_ID=" + entity_id, flush=True)
