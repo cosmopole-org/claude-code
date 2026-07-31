@@ -246,6 +246,43 @@ export function credentialSource(env) {
  * @param opts.onStderr       called with the child's stderr chunks (diagnostics)
  * @returns `{ result, messages, exitCode, timedOut, stderr, argv, warnings }`
  */
+/**
+ * The CLI's built-in shell + filesystem tools. In a Decillion space the agent must
+ * not run commands or touch files on its own private, ephemeral container — that
+ * work is invisible to the rest of the team and thrown away when the container
+ * recycles. The space's shared cloud sandbox is the real machine, so when the
+ * space has one these built-ins are turned OFF (`--disallowedTools`) and the agent
+ * is forced to do all shell/filesystem work through the sandbox tool, where its
+ * teammates see the same files and output.
+ */
+export const DEFAULT_BUILTIN_FS_TOOLS = [
+  "Bash",
+  "Read",
+  "Write",
+  "Edit",
+  "MultiEdit",
+  "NotebookEdit",
+  "NotebookRead",
+  "Glob",
+  "Grep",
+  "LS",
+];
+
+/**
+ * Which built-in tools to deny for this run. Empty unless the space has a shared
+ * execution environment (`hasSharedEnv`) — with no sandbox, denying the built-ins
+ * would leave the agent unable to run anything at all. `CLAUDE_CREATURE_FORCE_SANDBOX_FS=0`
+ * disables the behaviour; `CLAUDE_CREATURE_DISALLOWED_TOOLS` overrides the list.
+ */
+export function disallowedBuiltinTools({ hasSharedEnv, env = process.env } = {}) {
+  const flag = env.CLAUDE_CREATURE_FORCE_SANDBOX_FS;
+  const on = flag === undefined || String(flag).trim() === "" ? true : !["0", "false", "no", "off"].includes(String(flag).trim().toLowerCase());
+  if (!on || !hasSharedEnv) return [];
+  const override = (env.CLAUDE_CREATURE_DISALLOWED_TOOLS || "").trim();
+  if (override) return override.split(",").map((s) => s.trim()).filter(Boolean);
+  return [...DEFAULT_BUILTIN_FS_TOOLS];
+}
+
 export async function runClaude(opts) {
   const {
     prompt,

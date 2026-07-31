@@ -40,7 +40,7 @@ import path from "node:path";
 import { bridgeFromEnv } from "./bridge.mjs";
 import { materializeAttachments } from "./attachments.mjs";
 import { buildToolDefinitions, mergeCatalogs } from "./catalog.mjs";
-import { runClaude, runTempDir } from "./claudeRunner.mjs";
+import { disallowedBuiltinTools, runClaude, runTempDir } from "./claudeRunner.mjs";
 import { discoverSpaceCatalog } from "./discovery.mjs";
 import { TrajectoryMapper } from "./events.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
@@ -199,7 +199,11 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     return category === "execution" || /sandbox/.test(name);
   });
   const sharedEnv = sharedEnvDef ? { name: sharedEnvDef.name, description: sharedEnvDef.description } : undefined;
-  const systemPrompt = buildSystemPrompt(task, { capabilities, sharedEnv });
+  // Force shell + filesystem work onto the shared sandbox: with a sandbox present,
+  // the CLI's own Bash/Read/Write/… built-ins are turned off, so the agent cannot
+  // do throwaway work on its private container that its teammates never see.
+  const disallowedTools = disallowedBuiltinTools({ hasSharedEnv: Boolean(sharedEnv) });
+  const systemPrompt = buildSystemPrompt(task, { capabilities, sharedEnv, disabledBuiltins: disallowedTools });
   const prompt = buildUserPrompt(task, { objective, attachments, workspace });
   const maxWallSeconds = Number(config.max_wall_seconds || process.env.CLAUDE_CREATURE_MAX_WALL_SECONDS || 900);
 
@@ -209,6 +213,8 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     objective_chars: objective.length,
     history_turns: Array.isArray(task.history) ? task.history.length : 0,
     tools: toolDefs.map((t) => t.name),
+    shared_env: sharedEnv?.name,
+    disallowed_builtins: disallowedTools.length ? disallowedTools : undefined,
     skill: Boolean(task.skill),
     group_chat: Boolean(task.groupChat || task.group_chat),
     roster: Array.isArray(task.roster) ? task.roster.length : 0,
@@ -232,6 +238,9 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
       // this an employment is refused outright whenever the permission mode is
       // anything but `bypassPermissions`.
       allowedTools: mcpConfig ? [`mcp__${MCP_SERVER_NAME}`, ...toolDefs.map((t) => `mcp__${MCP_SERVER_NAME}__${t.name}`)] : undefined,
+      // Turn off the CLI's own shell/filesystem built-ins when the space has a
+      // shared sandbox, so bash and file work are forced onto it (see above).
+      disallowedTools,
       maxWallSeconds,
       onMessage: (message) => {
         for (const event of mapper.map(message)) emit(event);

@@ -127,6 +127,16 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
   const render = (c) => `  • ${c.name}${c.description ? ` — ${String(c.description).slice(0, 300)}` : ""}`;
 
   const sharedEnv = opts.sharedEnv && opts.sharedEnv.name ? opts.sharedEnv : null;
+  const disabledBuiltins = Array.isArray(opts.disabledBuiltins) ? opts.disabledBuiltins.filter(Boolean) : [];
+  const offClause = disabledBuiltins.length
+    ? " Your engine's own built-in shell and file tools (" +
+      disabledBuiltins.slice(0, 8).join(", ") +
+      (disabledBuiltins.length > 8 ? ", …" : "") +
+      ") are turned OFF in this space on purpose — running a command or touching a " +
+      "file means calling `" +
+      sharedEnv?.name +
+      "`; there is no other shell or filesystem available to you here."
+    : "";
   const sharedBlock = sharedEnv
     ? "SHARED WORKSPACE — `" +
       sharedEnv.name +
@@ -136,7 +146,9 @@ export function capabilitiesPreamble(capabilities, opts = {}) {
       "test, and read/write the project's files THERE through that tool, so the other " +
       "agents and people see the same files and results. Your local working directory " +
       "is private scratch that no one else can see — never leave shared project work " +
-      "only in it.\n"
+      "only in it." +
+      offClause +
+      "\n"
     : "";
 
   const sections = [];
@@ -178,7 +190,7 @@ export function buildSystemPrompt(task, opts = {}) {
   const group = groupChatPreamble(task);
   if (group) parts.push(group);
 
-  const capabilities = capabilitiesPreamble(opts.capabilities, { sharedEnv: opts.sharedEnv });
+  const capabilities = capabilitiesPreamble(opts.capabilities, { sharedEnv: opts.sharedEnv, disabledBuiltins: opts.disabledBuiltins });
   if (capabilities) parts.push(capabilities);
 
   const skill = typeof task.skill === "string" && task.skill.trim() ? task.skill.trim() : typeof task.systemInstruction === "string" ? task.systemInstruction.trim() : "";
