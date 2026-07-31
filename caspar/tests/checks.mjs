@@ -317,6 +317,34 @@ await check("credentials are masked out of streamed steps", () => {
 
 // ── gateway-level checks ─────────────────────────────────────────────────────
 
+await check("a signal arriving before any listener is buffered and replayed on subscribe", async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const gateway = await new FakeGateway().listen();
+  const bridge = await bridgeFromEnv({ env: { CASPAR_GATEWAY_HOST: "127.0.0.1", CASPAR_GATEWAY_PORT: String(gateway.port) }, timeoutMs: 5000 });
+  try {
+    // The node flushes packets it queued while the creature was cold right after
+    // WELCOME — they can land before the serve loop subscribes. That must not drop
+    // them (it would hang the caller).
+    gateway.pushSignal("creatures/signal", { data: JSON.stringify({ kind: "invoke", tool_id: "t", correlationId: "c1", payload: {} }) });
+    for (let i = 0; i < 100 && bridge._earlySignals.length === 0; i++) await sleep(5);
+    assert.equal(bridge._earlySignals.length, 1, "the early signal must be buffered, not dropped");
+
+    const received = [];
+    bridge.onSignal((key, data) => received.push([key, data]));
+    assert.equal(received.length, 1, "registering a listener replays the buffered signal");
+    assert.equal(received[0][0], "creatures/signal");
+    assert.equal(bridge._earlySignals.length, 0, "the buffer is drained once replayed");
+
+    // A later signal goes straight through, not into the buffer.
+    gateway.pushSignal("creatures/signal", { data: JSON.stringify({ kind: "invoke", tool_id: "t", correlationId: "c2", payload: {} }) });
+    for (let i = 0; i < 100 && received.length < 2; i++) await sleep(5);
+    assert.equal(received.length, 2, "a signal after subscribe is delivered live");
+  } finally {
+    bridge.close();
+    await gateway.close();
+  }
+});
+
 await check("the handshake adopts the node-assigned identity and large messages chunk", async () => {
   const gateway = await new FakeGateway({ identity: { machineId: "77@global", programId: "77@global", vmId: "vm-77" } }).listen();
   const bridge = await bridgeFromEnv({ env: { CASPAR_GATEWAY_HOST: "127.0.0.1", CASPAR_GATEWAY_PORT: String(gateway.port) }, timeoutMs: 5000 });

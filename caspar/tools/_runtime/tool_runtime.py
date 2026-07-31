@@ -299,40 +299,6 @@ def _handle_invoke(bridge, packet: dict) -> None:
             print(f"TOOL_BRIDGE {json.dumps({'reply_error': repr(exc)[:160]})}", flush=True)
 
 
-def _drain_pending_task(on_signal) -> None:
-    """Feed a node-delivered ``task.json`` invoke through the serve path, once.
-
-    The cold-spawn handoff (see the call site): the node writes the triggering
-    signal to ``/app/input/task.json`` for a freshly booted serving tool. We read
-    it, remove it so it is handled exactly once, and hand it to ``on_signal`` as if
-    it had arrived over the gateway — reusing the same extract → dispatch → reply
-    logic (including the reply back to the caller's ``reply_to``). Best-effort: any
-    read/parse error is swallowed so a malformed or absent file never blocks the
-    serve loop.
-    """
-    path = os.path.join(INPUT_DIR, "task.json")
-    if not os.path.isfile(path):
-        return
-    data = None
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception as exc:  # noqa: BLE001 — a bad file must never block serving
-        print(f"TOOL_BRIDGE {json.dumps({'pending_task_error': repr(exc)[:160]})}", flush=True)
-    # Consume it regardless of parse outcome: it belongs to this one cold spawn and
-    # must not be re-handled if the container later restarts on the same mount.
-    try:
-        os.remove(path)
-    except OSError:
-        pass
-    if isinstance(data, dict):
-        print(f"TOOL_BRIDGE {json.dumps({'pending_task': True, 'kind': data.get('kind')})}", flush=True)
-        try:
-            on_signal("creatures/signal", data)
-        except Exception as exc:  # noqa: BLE001
-            print(f"TOOL_BRIDGE {json.dumps({'pending_task_dispatch_error': repr(exc)[:160]})}", flush=True)
-
-
 def _serve(bridge) -> int:
     """Run the tool as a long-lived standalone creature.
 
@@ -362,18 +328,6 @@ def _serve(bridge) -> int:
         threading.Thread(target=_handle_invoke, args=(bridge, packet), daemon=True).start()
 
     bridge.on_signal(on_signal)
-
-    # Drain a signal the node delivered as a file rather than over the gateway.
-    # When this tool had gone cold, the node cold-spawns the container to serve a
-    # pending invoke — but a fresh container has no gateway connection yet, so the
-    # triggering signal cannot be pushed to it and would otherwise be lost, leaving
-    # the caller to hang until its timeout. The node therefore writes that signal
-    # to ``/app/input/task.json``; we feed it through the very same ``on_signal``
-    # path here, so a cold-spawned tool answers its first invoke instead of only
-    # waking up for the next one. Present only on a cold spawn; a warm serve start
-    # (a normal ``runEntity``) has no such file and skips straight to the loop.
-    _drain_pending_task(on_signal)
-
     print("TOOL_SERVE_READY " + json.dumps(
         {"tool_id": tool_id, "machine_id": getattr(bridge, "machine_id", ""),
          "program_id": getattr(bridge, "program_id", ""), "ts": time.time()}), flush=True)
