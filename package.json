@@ -25,6 +25,7 @@
     "caspar:build": "node caspar/build/buildCli.mjs",
     "caspar:serve": "node caspar/runtime.mjs",
     "check:caspar": "node caspar/tests/checks.mjs",
+    "check:caspar:discovery": "node caspar/tests/discovery-checks.mjs",
     "check:caspar:cli": "node caspar/tests/live-cli.mjs",
     "check:caspar:container": "node caspar/tests/container-check.mjs",
     "check:caspar:llm": "node caspar/tests/llm-checks.mjs",

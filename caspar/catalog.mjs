@@ -106,6 +106,34 @@ export function buildToolDefinitions(catalog) {
 }
 
 /**
+ * Union two catalogs, keyed by the creature's routing id. `primary`
+ * (`config.tools` from the backend) is authoritative and always kept — it
+ * carries the platform-pinned `defaults` (e.g. the bound `space_id`) that
+ * live-discovered entries cannot know. `extra` (from `discovery.mjs`) only
+ * contributes creatures the primary did not already list, so an agent sees the
+ * space's full roster without ever losing a binding.
+ */
+export function mergeCatalogs(primary, extra) {
+  const keyOf = (e) => String(e?.program_id || e?.programId || e?.tool_id || e?.creature_id || e?.creatureId || e?.name || "");
+  const out = [];
+  const seen = new Set();
+  for (const entry of Array.isArray(primary) ? primary : []) {
+    if (!entry || typeof entry !== "object") continue;
+    const key = keyOf(entry);
+    if (key) seen.add(key);
+    out.push(entry);
+  }
+  for (const entry of Array.isArray(extra) ? extra : []) {
+    if (!entry || typeof entry !== "object") continue;
+    const key = keyOf(entry);
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    out.push(entry);
+  }
+  return out;
+}
+
+/**
  * The arguments actually sent to a creature: the model's, with the platform's
  * pinned `defaults` applied on top (they win by design), and nulls dropped.
  */

@@ -39,8 +39,9 @@ import path from "node:path";
 
 import { bridgeFromEnv } from "./bridge.mjs";
 import { materializeAttachments } from "./attachments.mjs";
-import { buildToolDefinitions } from "./catalog.mjs";
+import { buildToolDefinitions, mergeCatalogs } from "./catalog.mjs";
 import { runClaude, runTempDir } from "./claudeRunner.mjs";
+import { discoverSpaceCatalog } from "./discovery.mjs";
 import { TrajectoryMapper } from "./events.mjs";
 import { buildSystemPrompt, buildUserPrompt } from "./prompt.mjs";
 import { buildResult } from "./result.mjs";
@@ -104,6 +105,22 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   const objective = taskObjective(task);
   const sessionId = threadSessionId(task, bridge ? `claude-${bridge.sessionId ?? "vm"}` : "claude-offline");
   const { config, tools } = catalogFromTask(task);
+
+  // The space's employable creatures. The backend sends `config.tools`, and —
+  // so the agent sees the space's live roster even when that catalog is thin —
+  // we also fetch the space's members straight from the node and merge in any it
+  // did not send (best-effort; `config.tools` stays authoritative, see
+  // discovery.mjs / mergeCatalogs). Bounded so a slow node never stalls a prompt.
+  let catalog = tools;
+  if (bridge && envFlag("CLAUDE_CREATURE_DISCOVER_TOOLS", true)) {
+    try {
+      const discovered = await discoverSpaceCatalog(bridge, task, { log: (info) => log("CLAUDE_DISCOVERY", info) });
+      if (discovered.length) catalog = mergeCatalogs(tools, discovered);
+    } catch (err) {
+      log("CLAUDE_DISCOVERY", { error: String(err?.message || err) });
+    }
+  }
+
   const workspace = path.join(workspaceRoot(), sessionSlug(sessionId));
   fs.mkdirSync(workspace, { recursive: true });
 
@@ -137,7 +154,7 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   // The space's creatures, exposed to Claude Code as MCP tools. Nothing is wired
   // when the space has none: an agent handed tools that do not exist will promise
   // capabilities it cannot deliver.
-  const { tools: toolDefs, byName } = buildToolDefinitions(tools);
+  const { tools: toolDefs, byName } = buildToolDefinitions(catalog);
   let invoker = null;
   let socketServer = null;
   let mcpConfig;
@@ -167,7 +184,11 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
     }
   }
 
-  const systemPrompt = buildSystemPrompt(task);
+  // Tell the model, in its system prompt, about the space's callable tools and
+  // sub-agents (by their exact MCP tool names) so it plans with them. Built from
+  // the same defs it can actually invoke, so what it reads matches what it calls.
+  const capabilities = toolDefs.map((t) => ({ name: t.name, description: t.description, kind: byName.get(t.name)?.kind || "tool" }));
+  const systemPrompt = buildSystemPrompt(task, { capabilities });
   const prompt = buildUserPrompt(task, { objective, attachments, workspace });
   const maxWallSeconds = Number(config.max_wall_seconds || process.env.CLAUDE_CREATURE_MAX_WALL_SECONDS || 900);
 

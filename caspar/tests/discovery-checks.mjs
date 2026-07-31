@@ -1,0 +1,200 @@
+#!/usr/bin/env node
+/**
+ * Checks for live in-space discovery (caspar/discovery.mjs) and the capability
+ * preamble it feeds into the system prompt.
+ *
+ * Pure functions are asserted directly; the fetch is driven end to end against
+ * the real `FakeGateway` (real wire protocol) with an `onCall` that answers
+ * `readMembers` + `getCreature` the way a node would. Asserts:
+ *   • the space id is resolved from the task (explicit and via sessionId);
+ *   • the fetch lists the store's members and reads each one's descriptor;
+ *   • a member with no decillion descriptor is skipped;
+ *   • discovered entries merge into config.tools WITHOUT displacing a backend
+ *     entry (which keeps its platform-pinned defaults);
+ *   • the merged catalog becomes callable MCP tools and is enumerated for the
+ *     model, sub-agents included.
+ *
+ * Run: node caspar/tests/discovery-checks.mjs
+ */
+
+import assert from "node:assert/strict";
+
+import { buildToolDefinitions, mergeCatalogs } from "../catalog.mjs";
+import { discoverSpaceCatalog, entryFromDescriptor, extractDescriptor, resolveSpaceId } from "../discovery.mjs";
+import { bridgeFromEnv } from "../bridge.mjs";
+import { buildSystemPrompt, capabilitiesPreamble } from "../prompt.mjs";
+import { FakeGateway } from "./fakeGateway.mjs";
+
+const GREEN = "\x1b[0;32m";
+const RED = "\x1b[0;31m";
+const NC = "\x1b[0m";
+
+let passed = 0;
+const failures = [];
+
+async function check(name, fn) {
+  try {
+    await fn();
+    passed += 1;
+    console.log(`${GREEN}✓${NC} ${name}`);
+  } catch (err) {
+    failures.push({ name, err });
+    console.log(`${RED}✗${NC} ${name}\n  ${String(err?.stack || err).split("\n").slice(0, 6).join("\n  ")}`);
+  }
+}
+
+// ── Fixtures ────────────────────────────────────────────────────────────────
+const SANDBOX_META = { public: { decillion: { kind: "tool", name: "sandbox", usecases: ["run code", "edit files"], howToTalk: "call exec/write/read", argSchema: { command: { type: "string" } }, function: "exec" } } };
+const RESEARCHER_META = { decillion: { kind: "agent", name: "Researcher", usecases: ["deep research"], howToTalk: "ask in prose" } };
+
+/** A node-shaped onCall: readMembers → members; getCreature → its metadata. */
+function nodeBehaviour({ members, metaById }) {
+  return (op, input) => {
+    if (op === "readMembers" || op === "listStoreMembers" || op === "listStoreAccess" || op === "listAccess") {
+      // Only answer for the right store; otherwise behave like "unknown store".
+      if (input?.storeId !== "space-1" && input?.id !== "space-1") return { ok: true, members: [] };
+      return { ok: true, members };
+    }
+    if (op === "getCreature") {
+      const meta = metaById[input?.userId || input?.creatureId];
+      return meta ? { ok: true, obj: meta } : { ok: true };
+    }
+    return { ok: true };
+  };
+}
+
+async function withBridge(onCall, fn) {
+  const gw = new FakeGateway({ identity: { programId: "9@global", creatureId: "8@global" }, onCall });
+  await gw.listen();
+  const prevHost = process.env.CASPAR_GATEWAY_HOST;
+  const prevPort = process.env.CASPAR_GATEWAY_PORT;
+  process.env.CASPAR_GATEWAY_HOST = "127.0.0.1";
+  process.env.CASPAR_GATEWAY_PORT = String(gw.port);
+  let bridge;
+  try {
+    bridge = await bridgeFromEnv({ timeoutMs: 4000 });
+    return await fn(bridge, gw);
+  } finally {
+    if (bridge) bridge.close();
+    await gw.close();
+    if (prevHost === undefined) delete process.env.CASPAR_GATEWAY_HOST;
+    else process.env.CASPAR_GATEWAY_HOST = prevHost;
+    if (prevPort === undefined) delete process.env.CASPAR_GATEWAY_PORT;
+    else process.env.CASPAR_GATEWAY_PORT = prevPort;
+  }
+}
+
+async function main() {
+  // ── pure helpers ──────────────────────────────────────────────────────────
+  await check("resolveSpaceId reads explicit id and parses sessionId", () => {
+    assert.equal(resolveSpaceId({ spaceId: "s-1" }), "s-1");
+    assert.equal(resolveSpaceId({ storeId: "s-2" }), "s-2");
+    assert.equal(resolveSpaceId({ sessionId: "space:s-3:agent-x" }), "s-3");
+    assert.equal(resolveSpaceId({ sessionId: "claude-default" }), "");
+    assert.equal(resolveSpaceId({}), "");
+  });
+
+  await check("extractDescriptor handles public.decillion, decillion, and bare", () => {
+    assert.equal(extractDescriptor({ obj: SANDBOX_META }).name, "sandbox");
+    assert.equal(extractDescriptor({ obj: RESEARCHER_META }).kind, "agent");
+    assert.equal(extractDescriptor({ kind: "tool", name: "x", usecases: [] }).name, "x");
+    assert.equal(extractDescriptor({ obj: { nothing: true } }), undefined);
+    assert.equal(extractDescriptor(null), undefined);
+  });
+
+  await check("entryFromDescriptor yields a catalog entry catalog.mjs can route", () => {
+    const e = entryFromDescriptor(SANDBOX_META.public.decillion, { creatureId: "c1", programId: "p1", entityId: "" });
+    assert.equal(e.program_id, "p1");
+    assert.equal(e.entity_id, "main");
+    assert.equal(e.function, "exec");
+    assert.ok(e.description.includes("Use when"));
+    const a = entryFromDescriptor(RESEARCHER_META.decillion, { creatureId: "c2", programId: "p2", entityId: "" });
+    assert.equal(a.kind, "agent");
+    assert.equal(a.entity_id, "agent"); // agents default to the proxy's agent entity
+    assert.ok(a.arg_schema.prompt, "an agent entry exposes a prose prompt argument");
+    const { tools, byName } = buildToolDefinitions([e, a]);
+    assert.equal(tools.length, 2);
+    assert.ok([...byName.values()].some((v) => v.kind === "agent"));
+  });
+
+  await check("mergeCatalogs keeps backend entries and only adds new ones", () => {
+    const backend = [{ name: "sandbox", program_id: "p1", defaults: { space_id: "space-1" } }];
+    const discovered = [
+      { name: "sandbox-dup", program_id: "p1" }, // same id → dropped, backend wins (keeps defaults)
+      { name: "researcher", program_id: "p2", kind: "agent" }, // new → added
+    ];
+    const merged = mergeCatalogs(backend, discovered);
+    assert.equal(merged.length, 2);
+    const sandbox = merged.find((e) => e.program_id === "p1");
+    assert.equal(sandbox.name, "sandbox");
+    assert.deepEqual(sandbox.defaults, { space_id: "space-1" }); // binding preserved
+    assert.ok(merged.find((e) => e.program_id === "p2"));
+  });
+
+  await check("capabilitiesPreamble enumerates tools and sub-agents, empty when none", () => {
+    assert.equal(capabilitiesPreamble([]), "");
+    const text = capabilitiesPreamble([
+      { name: "sandbox", description: "run code", kind: "tool" },
+      { name: "Researcher", description: "deep research", kind: "agent" },
+    ]);
+    assert.ok(text.includes("WHAT YOU CAN DO IN THIS SPACE"));
+    assert.ok(text.includes("sandbox"));
+    assert.ok(/delegate/i.test(text));
+    assert.ok(text.includes("Researcher"));
+    // it is included in the full system prompt
+    const sys = buildSystemPrompt({ spaceId: "space-1" }, { capabilities: [{ name: "sandbox", description: "run code", kind: "tool" }] });
+    assert.ok(sys.includes("sandbox"));
+  });
+
+  // ── live fetch over the real gateway wire ──────────────────────────────────
+  await check("discoverSpaceCatalog fetches members + descriptors from the node", async () => {
+    const members = [
+      { creatureId: "cx-sandbox", programId: "px-sandbox", entityId: "main" },
+      { creatureId: "cx-researcher", programId: "px-researcher" },
+      { creatureId: "cx-plain", programId: "px-plain" }, // no descriptor → skipped
+    ];
+    const metaById = { "cx-sandbox": SANDBOX_META, "cx-researcher": RESEARCHER_META };
+    await withBridge(nodeBehaviour({ members, metaById }), async (bridge, gw) => {
+      const entries = await discoverSpaceCatalog(bridge, { spaceId: "space-1" }, { timeoutMs: 3000 });
+      assert.equal(entries.length, 2, "only the two creatures with a descriptor");
+      const names = entries.map((e) => e.name).sort();
+      assert.deepEqual(names, ["Researcher", "sandbox"]);
+      assert.ok(entries.find((e) => e.program_id === "px-sandbox"));
+      // it actually listed members and read each creature over the gateway
+      assert.ok(gw.calls.some((c) => /Members|Access/i.test(c.op)), "a member-listing host call was made");
+      assert.equal(gw.calls.filter((c) => c.op === "getCreature").length, 3, "each member's creature record was read");
+    });
+  });
+
+  await check("discoverSpaceCatalog is empty (never throws) with no space / no members", async () => {
+    await withBridge(nodeBehaviour({ members: [], metaById: {} }), async (bridge) => {
+      assert.deepEqual(await discoverSpaceCatalog(bridge, { sessionId: "space:other:x" }, { timeoutMs: 2000 }), []);
+      assert.deepEqual(await discoverSpaceCatalog(bridge, {}, { timeoutMs: 2000 }), []); // no space id at all
+    });
+    assert.deepEqual(await discoverSpaceCatalog(null, { spaceId: "space-1" }), []); // no bridge
+  });
+
+  await check("discovered catalog merges with config.tools into callable MCP tools", async () => {
+    const members = [{ creatureId: "cx-researcher", programId: "px-researcher" }];
+    const metaById = { "cx-researcher": RESEARCHER_META };
+    await withBridge(nodeBehaviour({ members, metaById }), async (bridge) => {
+      const configTools = [{ name: "sandbox", program_id: "px-sandbox", kind: "tool", defaults: { space_id: "space-1" } }];
+      const discovered = await discoverSpaceCatalog(bridge, { spaceId: "space-1" }, { timeoutMs: 3000 });
+      const merged = mergeCatalogs(configTools, discovered);
+      const { tools, byName } = buildToolDefinitions(merged);
+      assert.equal(tools.length, 2, "sandbox (config) + researcher (discovered)");
+      const caps = tools.map((t) => ({ name: t.name, description: t.description, kind: byName.get(t.name)?.kind || "tool" }));
+      const preamble = capabilitiesPreamble(caps);
+      assert.ok(/delegate to/i.test(preamble) || /delegate/i.test(preamble));
+      assert.ok(caps.some((c) => c.kind === "agent"), "the discovered sub-agent is offered for delegation");
+    });
+  });
+
+  console.log(`\n${failures.length ? RED : GREEN}${passed} passed, ${failures.length} failed${NC}`);
+  process.exit(failures.length ? 1 : 0);
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

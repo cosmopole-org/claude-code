@@ -69,7 +69,8 @@ which the node relays while keeping the correlation open.
 | `bridge.mjs` | The docker-host bridge gateway client: chunked framing, HELLO/WELCOME, host calls (`signalUser`, `dbOp`, `httpRequest`), pushed signals. |
 | `taskSignal.mjs` | Peels the StoresSend / `payload` / proxy envelopes into a task; derives the conversation thread key. |
 | `prompt.mjs` | Composes what Claude Code is given: the agent's skill as persona, the group-chat preamble and roster, the thread's history with `[From → To]` annotations. |
-| `catalog.mjs` | Turns the space's `config.tools` into MCP tool definitions; applies the platform's pinned `defaults` after the model's arguments. |
+| `catalog.mjs` | Turns the space's `config.tools` into MCP tool definitions; applies the platform's pinned `defaults` after the model's arguments; `mergeCatalogs` unions the backend catalog with live discovery. |
+| `discovery.mjs` | Fetches the space's employable creatures (tools, apps, sub-agents) straight from the node at prompt time (`readMembers` + `getCreature`) and builds catalog entries, so the agent sees the space's live roster even when `config.tools` is thin. |
 | `toolInvoker.mjs` | Employs a tool creature over the gateway and awaits its correlated `tools/result`. |
 | `toolSocket.mjs` / `mcpStdioServer.mjs` | The `caspar` MCP server Claude Code talks to, and its unix-socket link back to this process (which owns the single gateway connection). |
 | `claudeRunner.mjs` | Runs the CLI headless: flags, per-agent LLM override, privilege drop, wall-clock kill. |
@@ -83,6 +84,36 @@ which the node relays while keeping the correlation open.
 Session state: each conversation thread (`space:<spaceId>:<agentId>`) gets its own
 workspace under `/data/workspaces/…`, on the VM's persistent mount, so a project's
 files survive container restarts.
+
+---
+
+## Seeing the space: tools, apps, creatures and other agents
+
+On every prompt the agent is given the space's employable creatures — the project
+sandbox, published tools and apps, and the **other agents** — as real, callable
+MCP tools, and its system prompt enumerates them so it *plans with* them instead
+of only answering from its own knowledge. Sub-agents are offered for delegation:
+the agent can hand a sub-task to another agent by calling it with a prose prompt.
+
+Two sources feed that catalog, unioned by `mergeCatalogs`:
+
+1. **`config.tools`** — the catalog the backend's `DiscoveryService` sends with the
+   prompt (a space's member programs paired with their `public.decillion`
+   descriptors). It is **authoritative**: it carries the platform-pinned `defaults`
+   (e.g. the bound `space_id`) that keep a shared tool working on *this* space.
+2. **Live discovery** (`discovery.mjs`) — the creature also fetches the space's
+   members itself, over the gateway, using the node's own host functions
+   (`readMembers` on the space store → `getCreature` per member for its
+   descriptor). This mirrors `DiscoveryService` exactly but from inside the
+   container, so the agent sees the space's live roster even when the backend sends
+   a thin `config.tools`. It is **best-effort**: an unresolved space id, a host op
+   the node does not expose, or an unexpected shape all yield nothing rather than an
+   error, and a discovered entry only *adds* a creature the backend did not send —
+   it never displaces a backend entry or its pinned binding.
+
+Knobs (env): `CLAUDE_CREATURE_DISCOVER_TOOLS` (default on), `_DISCOVER_TIMEOUT_MS`
+(default 8000), `_DISCOVER_MAX` (default 50 members). `node caspar/tests/discovery-checks.mjs`
+drives the fetch, merge and prompt end to end against the real gateway wire.
 
 ---
 

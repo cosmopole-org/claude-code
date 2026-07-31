@@ -105,16 +105,60 @@ export function groupChatPreamble(task) {
 }
 
 /**
- * The system prompt appended to Claude Code's own: the group-chat context plus
- * the agent's persona (its deployed skill), declared authoritative for identity
- * so an agent deployed as "Tina" answers as Tina and never as the underlying
- * engine. Also states the answer contract: the final assistant message is what
- * the user in the chat receives.
+ * The "what you can do in this space" section: the tools, apps, creatures and
+ * sub-agents the space contains, so the model plans WITH them instead of only
+ * answering from its own knowledge. Each is a real, callable tool (surfaced under
+ * the `caspar` MCP server); sub-agents are creatures it can delegate whole
+ * sub-tasks to. Empty when the space has no employable creatures, so a bare
+ * one-shot prompt is unaffected.
+ *
+ * `capabilities` is `[{ name, description, kind }]` — `name` is the exact MCP
+ * tool name the model calls, so what it reads here matches what it can invoke.
  */
-export function buildSystemPrompt(task) {
+export function capabilitiesPreamble(capabilities) {
+  const list = Array.isArray(capabilities) ? capabilities.filter((c) => c && typeof c === "object" && c.name) : [];
+  if (!list.length) return "";
+  const agents = list.filter((c) => c.kind === "agent");
+  const tools = list.filter((c) => c.kind !== "agent");
+  const render = (c) => `  • ${c.name}${c.description ? ` — ${String(c.description).slice(0, 300)}` : ""}`;
+
+  const sections = [];
+  if (tools.length) sections.push(`Tools & creatures you can call:\n${tools.map(render).join("\n")}`);
+  if (agents.length) sections.push(`Other agents you can delegate to (call them like a tool, with a prose \`prompt\`):\n${agents.map(render).join("\n")}`);
+
+  return (
+    "=== WHAT YOU CAN DO IN THIS SPACE ===\n" +
+    "This space gives you real, callable capabilities beyond answering from your " +
+    "own knowledge. They are exposed to you as tools under the `caspar` MCP " +
+    "server — call them directly. Treat them as first-class options when you plan: " +
+    "prefer using a listed tool or delegating to a listed sub-agent over guessing " +
+    "or doing by hand what one of them is built for.\n" +
+    sections.join("\n") +
+    "\n" +
+    "When a listed sub-agent is better suited to part of the request, delegate that " +
+    "part to it (call it with a clear `prompt`) and fold its result into your answer. " +
+    "Only call a capability when it actually helps the current request.\n" +
+    "=== END WHAT YOU CAN DO ===\n"
+  );
+}
+
+/**
+ * The system prompt appended to Claude Code's own: the group-chat context, the
+ * space's callable capabilities, plus the agent's persona (its deployed skill),
+ * declared authoritative for identity so an agent deployed as "Tina" answers as
+ * Tina and never as the underlying engine. Also states the answer contract: the
+ * final assistant message is what the user in the chat receives.
+ *
+ * `opts.capabilities` (from the merged tool catalog) enumerates the space's
+ * tools/creatures/sub-agents for the model to plan over.
+ */
+export function buildSystemPrompt(task, opts = {}) {
   const parts = [];
   const group = groupChatPreamble(task);
   if (group) parts.push(group);
+
+  const capabilities = capabilitiesPreamble(opts.capabilities);
+  if (capabilities) parts.push(capabilities);
 
   const skill = typeof task.skill === "string" && task.skill.trim() ? task.skill.trim() : typeof task.systemInstruction === "string" ? task.systemInstruction.trim() : "";
   if (skill) {
