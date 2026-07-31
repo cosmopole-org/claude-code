@@ -141,9 +141,24 @@ async function main() {
     assert.ok(text.includes("sandbox"));
     assert.ok(/delegate/i.test(text));
     assert.ok(text.includes("Researcher"));
+    // it tells the model to answer capability questions with THESE, not built-ins
+    assert.ok(/not the generic editor\/shell built-ins/i.test(text));
     // it is included in the full system prompt
     const sys = buildSystemPrompt({ spaceId: "space-1" }, { capabilities: [{ name: "sandbox", description: "run code", kind: "tool" }] });
     assert.ok(sys.includes("sandbox"));
+  });
+
+  await check("shared sandbox reframes the agent's filesystem as the space's shared machine", () => {
+    const caps = [{ name: "sandbox", description: "run code", kind: "tool" }];
+    const withEnv = capabilitiesPreamble(caps, { sharedEnv: { name: "sandbox", description: "run code" } });
+    assert.ok(/SHARED WORKSPACE/i.test(withEnv));
+    assert.ok(/private scratch/i.test(withEnv), "it warns the local dir is private");
+    // no shared-env block when the space has no shared machine
+    const noEnv = capabilitiesPreamble(caps);
+    assert.ok(!/SHARED WORKSPACE/i.test(noEnv));
+    // the delivery section no longer tells the agent to work in its own local dir
+    const sys = buildSystemPrompt({ spaceId: "space-1" }, { capabilities: caps, sharedEnv: { name: "sandbox", description: "run code" } });
+    assert.ok(/shared machine/i.test(sys));
   });
 
   // ── live fetch over the real gateway wire ──────────────────────────────────

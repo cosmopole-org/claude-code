@@ -107,20 +107,37 @@ export function groupChatPreamble(task) {
 /**
  * The "what you can do in this space" section: the tools, apps, creatures and
  * sub-agents the space contains, so the model plans WITH them instead of only
- * answering from its own knowledge. Each is a real, callable tool (surfaced under
- * the `caspar` MCP server); sub-agents are creatures it can delegate whole
- * sub-tasks to. Empty when the space has no employable creatures, so a bare
- * one-shot prompt is unaffected.
+ * answering from its own knowledge or its harness's generic built-ins. Each is a
+ * real, callable tool (surfaced under the `caspar` MCP server); sub-agents are
+ * creatures it can delegate whole sub-tasks to. Empty when the space has no
+ * employable creatures, so a bare one-shot prompt is unaffected.
  *
  * `capabilities` is `[{ name, description, kind }]` — `name` is the exact MCP
  * tool name the model calls, so what it reads here matches what it can invoke.
+ * `opts.sharedEnv` (`{ name, description }`) is the space's shared machine (the
+ * cloud sandbox), when the space has one: the team's real, shared filesystem and
+ * shell, which the agent must use for collaborative work instead of its own
+ * private local workspace.
  */
-export function capabilitiesPreamble(capabilities) {
+export function capabilitiesPreamble(capabilities, opts = {}) {
   const list = Array.isArray(capabilities) ? capabilities.filter((c) => c && typeof c === "object" && c.name) : [];
   if (!list.length) return "";
   const agents = list.filter((c) => c.kind === "agent");
   const tools = list.filter((c) => c.kind !== "agent");
   const render = (c) => `  • ${c.name}${c.description ? ` — ${String(c.description).slice(0, 300)}` : ""}`;
+
+  const sharedEnv = opts.sharedEnv && opts.sharedEnv.name ? opts.sharedEnv : null;
+  const sharedBlock = sharedEnv
+    ? "SHARED WORKSPACE — `" +
+      sharedEnv.name +
+      "` is this space's shared cloud machine (a real filesystem + shell), bound to " +
+      "this space and shared by everyone in it. IT, not your own local working " +
+      "directory, is where the team collaborates: run shell commands, install, build, " +
+      "test, and read/write the project's files THERE through that tool, so the other " +
+      "agents and people see the same files and results. Your local working directory " +
+      "is private scratch that no one else can see — never leave shared project work " +
+      "only in it.\n"
+    : "";
 
   const sections = [];
   if (tools.length) sections.push(`Tools & creatures you can call:\n${tools.map(render).join("\n")}`);
@@ -128,16 +145,20 @@ export function capabilitiesPreamble(capabilities) {
 
   return (
     "=== WHAT YOU CAN DO IN THIS SPACE ===\n" +
-    "This space gives you real, callable capabilities beyond answering from your " +
-    "own knowledge. They are exposed to you as tools under the `caspar` MCP " +
-    "server — call them directly. Treat them as first-class options when you plan: " +
-    "prefer using a listed tool or delegating to a listed sub-agent over guessing " +
-    "or doing by hand what one of them is built for.\n" +
+    "You are working inside a shared project space, not a private terminal. Your " +
+    "real capabilities here are the space's own tools, its shared machine and the " +
+    "other participants — exposed to you as tools under the `caspar` MCP server. " +
+    "Treat THESE as what you can do: when someone asks what tools or capabilities " +
+    "you have, answer with these, not the generic editor/shell built-ins of the " +
+    "harness you happen to run on.\n" +
+    sharedBlock +
     sections.join("\n") +
     "\n" +
-    "When a listed sub-agent is better suited to part of the request, delegate that " +
-    "part to it (call it with a clear `prompt`) and fold its result into your answer. " +
-    "Only call a capability when it actually helps the current request.\n" +
+    "Plan with them: prefer a listed tool or delegating to a listed sub-agent over " +
+    "guessing or doing by hand what one of them is built for. When a sub-agent is " +
+    "better suited to part of the request, delegate that part to it (call it with a " +
+    "clear `prompt`) and fold its result into your answer. Only call a capability " +
+    "when it actually helps the current request.\n" +
     "=== END WHAT YOU CAN DO ===\n"
   );
 }
@@ -157,7 +178,7 @@ export function buildSystemPrompt(task, opts = {}) {
   const group = groupChatPreamble(task);
   if (group) parts.push(group);
 
-  const capabilities = capabilitiesPreamble(opts.capabilities);
+  const capabilities = capabilitiesPreamble(opts.capabilities, { sharedEnv: opts.sharedEnv });
   if (capabilities) parts.push(capabilities);
 
   const skill = typeof task.skill === "string" && task.skill.trim() ? task.skill.trim() : typeof task.systemInstruction === "string" ? task.systemInstruction.trim() : "";
@@ -182,8 +203,10 @@ export function buildSystemPrompt(task, opts = {}) {
       "self-contained prose, no meta-commentary about tools, files or steps you " +
       "took unless it is what they asked for. Intermediate work (thinking, tool " +
       "calls, their results) is streamed to the UI separately as progress, so do " +
-      "not summarise your own process in the final message. You have a working " +
-      "directory of your own and may freely read, write and run code in it.\n" +
+      "not summarise your own process in the final message. You also have a " +
+      "private local working directory of your own for scratch — but anything the " +
+      "team must see belongs on the space's shared machine (see your capabilities " +
+      "above), not there.\n" +
       "=== END DELIVERY ===\n",
   );
   return parts.join("\n");

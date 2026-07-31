@@ -188,7 +188,18 @@ async function handleTask(bridge, { task, replyTo, correlationId, streamTo }) {
   // sub-agents (by their exact MCP tool names) so it plans with them. Built from
   // the same defs it can actually invoke, so what it reads matches what it calls.
   const capabilities = toolDefs.map((t) => ({ name: t.name, description: t.description, kind: byName.get(t.name)?.kind || "tool" }));
-  const systemPrompt = buildSystemPrompt(task, { capabilities });
+  // The space's shared machine (the cloud sandbox): the agent must treat its
+  // filesystem/shell as the collaborative workspace, not its private local dir.
+  // Recognised by the descriptor the platform publishes (category "execution")
+  // or a sandbox-shaped name — no hardcoded program id.
+  const sharedEnvDef = toolDefs.find((t) => {
+    const entry = byName.get(t.name) || {};
+    const category = String(entry.category || "").toLowerCase();
+    const name = String(entry.name || t.name).toLowerCase();
+    return category === "execution" || /sandbox/.test(name);
+  });
+  const sharedEnv = sharedEnvDef ? { name: sharedEnvDef.name, description: sharedEnvDef.description } : undefined;
+  const systemPrompt = buildSystemPrompt(task, { capabilities, sharedEnv });
   const prompt = buildUserPrompt(task, { objective, attachments, workspace });
   const maxWallSeconds = Number(config.max_wall_seconds || process.env.CLAUDE_CREATURE_MAX_WALL_SECONDS || 900);
 
