@@ -159,12 +159,20 @@ class CasparSignalingClient:
 
     def deploy(self, program_id: str, entity_id: str, entity_type: str,
                primary_b64: str, files_b64: Optional[Dict[str, str]] = None,
-               metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+               metadata: Optional[Dict[str, Any]] = None,
+               downloadable: bool = False) -> Dict[str, Any]:
+        """Deploy an entity onto a program.
+
+        ``downloadable=True`` marks it as a client-side front-end script the node
+        serves on demand via ``/programs/downloadEntity`` (never run on the node);
+        this is how a tool's Victor mini-app front-end rides on the same program
+        as its back-end creature.
+        """
         meta = dict(metadata or {})
         if files_b64:
             meta["files"] = files_b64
         r = self.send("/programs/deploy", {"machineId": program_id, "entityId": entity_id,
-                                           "entityType": entity_type, "downloadable": False,
+                                           "entityType": entity_type, "downloadable": bool(downloadable),
                                            "payload": primary_b64, "metadata": meta})
         if r.get("_res_code", -1) != 0:
             raise RuntimeError(f"deploy failed: {r}")

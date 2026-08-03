@@ -74,6 +74,14 @@ from caspar_signaling import CasparSignalingClient  # noqa: E402
 TOOL_ID = "vercel_sandbox"
 TOOLS_DIR = REPO / "caspar" / "tools"
 
+# The tool's Victor mini-app front-end: an Elpian-based JS file explorer that
+# runs in the Decillion client (not on the node) and reaches this back-end over
+# the host bridge. It ships as a *downloadable* `frontend` entity on the SAME
+# program as the docker back-end, so a space that has the sandbox tool also has
+# its UI with nothing extra to wire.
+FRONTEND_ENTITY_ID = "frontend"
+FRONTEND_SOURCE = TOOLS_DIR / TOOL_ID / "frontend" / "explorer.js"
+
 # Every name the tool reads. All three token spellings are here on purpose: the
 # tool accepts any of them, so baking only VERCEL_TOKEN would let an operator who
 # set VERCEL_API_TOKEN deploy a creature that looks fine and refuses every call.
@@ -116,6 +124,34 @@ def descriptor() -> Dict[str, object]:
         return json.loads((TOOLS_DIR / TOOL_ID / "point.metadata.json").read_text())
     except Exception:  # noqa: BLE001
         return {}
+
+
+def deploy_frontend(client: "CasparSignalingClient", program_id: str) -> bool:
+    """Deploy the tool's downloadable Victor front-end onto the same program.
+
+    Non-fatal: a node that predates downloadable entities (or a missing source)
+    only warns — the back-end is fully functional without the UI, and the client
+    simply shows no desktop tile for a program that has no `frontend` entity.
+    """
+    if not FRONTEND_SOURCE.exists():
+        warn(f"no front-end source at {FRONTEND_SOURCE} — skipping the desktop UI")
+        return False
+    try:
+        client.deploy(
+            program_id,
+            FRONTEND_ENTITY_ID,
+            "javascript",
+            b64_file(FRONTEND_SOURCE),
+            metadata={"decillion": {"tool_id": TOOL_ID, "kind": "frontend",
+                                    "host": "victor", "entry": "module.js"}},
+            downloadable=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — the back-end deploy already succeeded
+        warn(f"front-end deploy failed ({exc}); the sandbox works, but its desktop UI won't load")
+        return False
+    ok(f"{TOOL_ID} front-end deployed: program={program_id} entity={FRONTEND_ENTITY_ID} (downloadable)")
+    print("SANDBOX_TOOL_FRONTEND_ENTITY_ID=" + FRONTEND_ENTITY_ID, flush=True)
+    return True
 
 
 def compose_dockerfile(files: Dict[str, str]):
@@ -216,6 +252,9 @@ def main() -> int:
     print("SANDBOX_TOOL_PROGRAM_ID=" + program_id, flush=True)
     print("SANDBOX_TOOL_CREATURE_ID=" + creature_id, flush=True)
     print("SANDBOX_TOOL_ENTITY_ID=" + entity_id, flush=True)
+
+    # Ship the downloadable Victor front-end onto the same program (best-effort).
+    deploy_frontend(client, program_id)
 
     # Start it as a long-lived serving creature: the tool runtime stays in its serve
     # loop and answers every signal over the gateway, so Nest's create/delete calls

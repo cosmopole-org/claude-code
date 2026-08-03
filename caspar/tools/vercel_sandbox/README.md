@@ -52,6 +52,23 @@ so an agent cannot reach another space's sandbox.
 `exec` runs the command line through `sh -c` (so `&&`, pipes and redirects
 work) unless an explicit `args` array is passed.
 
+## The front-end (the space desktop)
+
+The tool has **two parts on one program**: this docker back-end (entity
+`vercel_sandbox`) and a downloadable Victor mini-app **front-end** (entity
+`frontend`, `frontend/explorer.js`). The front-end is an Elpian-based JS file
+explorer that runs in the Decillion client's Victor host — the space "desktop" —
+not on the node. `deploy_sandbox_tool.py` deploys it as a `downloadable`
+`javascript` entity right after the back-end, so any space with the sandbox tool
+gets its UI for free; the node serves it on demand via `/programs/downloadEntity`.
+
+It reaches this back-end over the client's **host bridge**: the explorer calls
+`hostCall("list_dir" | "read", …)`, the client signs the matching Caspar signal
+with the **human user's** identity and returns the reply. The guest never holds a
+key or a socket. The explorer is read-only — it lists directories
+(`list_dir`, added for structured `{name, type, size}` rows) and previews files
+(`read`) — so every member of a space can browse the shared machine safely.
+
 ## Configuration
 
 Credentials are read from the **container environment only** — never from the
