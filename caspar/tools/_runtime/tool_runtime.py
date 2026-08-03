@@ -299,20 +299,33 @@ def _handle_invoke(bridge, packet: dict) -> None:
             print(f"TOOL_BRIDGE {json.dumps({'reply_error': repr(exc)[:160]})}", flush=True)
 
 
-def _serve(bridge) -> int:
-    """Run the tool as a long-lived standalone creature.
+def _serve(bridge) -> str:
+    """Serve one gateway session for a long-lived standalone creature.
 
     The tool VM is started once (via ``runEntity``) and then stays alive,
     receiving work purely as pushed signals over the docker-host gateway and
     replying over the same channel. It never reads a task file and is never
     cold-spawned per call — Davinci and other creatures reach it through the
     Caspar signaling API.
+
+    Returns ``"reconnect"`` when the gateway link dropped (the caller should dial
+    a fresh connection and serve again) or ``"exit"`` when the tool intentionally
+    idled out.
+
+    **Idle-exit is opt-in.** A serving creature that exits on mere inactivity is
+    unreachable until something reboots it — which is exactly the "the sandbox
+    went to sleep after a few idle minutes and never woke up" failure: the node
+    has to notice the next signal is cold and resurrect the container, and any gap
+    in that path leaves the caller hanging forever. So by default the creature
+    stays warm and simply keeps serving. Set ``TOOL_SERVE_IDLE`` to a positive
+    number of seconds only for a rarely-used tool whose container you want freed
+    between bursts (the node cold-spawns it back on the next signal).
     """
     import threading
 
     tool_id = TOOL_ID or "unknown"
     state = {"last": time.time(), "served": 0}
-    idle_timeout = float(os.environ.get("TOOL_SERVE_IDLE", "600"))
+    idle_timeout = float(os.environ.get("TOOL_SERVE_IDLE", "0") or "0")
 
     def on_signal(key: str, data) -> None:
         if key != "creatures/signal":
@@ -332,16 +345,18 @@ def _serve(bridge) -> int:
         {"tool_id": tool_id, "machine_id": getattr(bridge, "machine_id", ""),
          "program_id": getattr(bridge, "program_id", ""), "ts": time.time()}), flush=True)
 
-    # Stay alive serving signals until the node terminates the VM (its
-    # max_exec_seconds) or no work has arrived for the idle window.
-    while time.time() - state["last"] < idle_timeout:
+    # Stay alive serving signals. Watch the gateway link: if it drops (node
+    # restart, transient blip) reconnect rather than sleeping on unreachable.
+    is_connected = getattr(bridge, "is_connected", None)
+    while True:
+        if callable(is_connected) and not is_connected():
+            print("TOOL_SERVE_RECONNECT " + json.dumps(
+                {"tool_id": tool_id, "served": state["served"], "ts": time.time()}), flush=True)
+            return "reconnect"
+        if idle_timeout > 0 and time.time() - state["last"] >= idle_timeout:
+            print("TOOL_SERVE_EXIT " + json.dumps({"tool_id": tool_id, "served": state["served"]}), flush=True)
+            return "exit"
         time.sleep(2)
-    print("TOOL_SERVE_EXIT " + json.dumps({"tool_id": tool_id, "served": state["served"]}), flush=True)
-    try:
-        bridge.close()
-    except Exception:  # noqa: BLE001
-        pass
-    return 0
 
 
 def _run_once_offline() -> int:
@@ -378,8 +393,30 @@ def main() -> int:
     }), flush=True)
     bridge = _connect_bridge()
     if bridge is not None:
-        print(f"TOOL_BRIDGE {json.dumps({'connected': True, 'session': bridge.session_id})}", flush=True)
-        return _serve(bridge)
+        # Serve, reconnecting whenever the gateway link drops, so the creature
+        # stays reachable across idle periods and transient blips instead of
+        # going cold and hanging every caller until it is redeployed.
+        global _BRIDGE
+        while True:
+            print(f"TOOL_BRIDGE {json.dumps({'connected': True, 'session': bridge.session_id})}", flush=True)
+            outcome = _serve(bridge)
+            try:
+                bridge.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if outcome != "reconnect":
+                return 0
+            # Dial a fresh connection. Drop the cached (now-dead) handle first so
+            # `_connect_bridge` reconnects instead of handing back the stale one.
+            _BRIDGE = None
+            bridge = _connect_bridge()
+            if bridge is None:
+                print("TOOL_SERVE_UNAVAILABLE " + json.dumps({
+                    "tool_id": TOOL_ID or "unknown",
+                    "reason": "gateway link dropped and could not be re-established — "
+                              "exiting so the node cold-spawns a fresh container",
+                }), flush=True)
+                return 0
     # No live gateway bridge ⇒ we cannot serve. Without this marker the runtime
     # would silently drop to a one-shot offline dispatch that prints TOOL_RESPONSE
     # and exits, never emitting TOOL_SERVE_READY — which the harness can only

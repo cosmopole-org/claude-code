@@ -106,6 +106,11 @@ export class CasparBridgeClient {
     this._earlySignalsCap = 512;
     this._buffer = Buffer.alloc(0);
     this._closed = false;
+    // Liveness: `true` between a successful handshake and the socket dropping.
+    // A serving creature watches this (and `onClose`) so it can reconnect when
+    // the gateway link dies instead of staying alive but unreachable forever.
+    this._connected = false;
+    this._closeListeners = new Set();
   }
 
   // -- lifecycle ------------------------------------------------------------
@@ -122,13 +127,43 @@ export class CasparBridgeClient {
         socket.off("error", onError);
         this._socket = socket;
         socket.on("data", (chunk) => this._onData(chunk));
-        socket.on("error", () => this._failAllPending());
-        socket.on("close", () => this._failAllPending());
+        socket.on("error", () => this._handleDisconnect());
+        socket.on("close", () => this._handleDisconnect());
         resolve();
       });
     });
     await this._handshake();
+    this._connected = true;
     return this;
+  }
+
+  /** True while the gateway link is live (handshaken and not dropped/closed). */
+  isConnected() {
+    return this._connected && !this._closed && this._socket != null;
+  }
+
+  /**
+   * Register a callback fired once when the gateway link drops **unexpectedly**
+   * (socket error/close), not on an intentional `close()`. Lets a serving
+   * creature wake immediately and reconnect. Returns an unsubscribe function.
+   */
+  onClose(cb) {
+    this._closeListeners.add(cb);
+    return () => this._closeListeners.delete(cb);
+  }
+
+  /** Socket dropped: fail in-flight calls and, if unexpected, notify watchers once. */
+  _handleDisconnect() {
+    this._failAllPending();
+    if (this._closed || !this._connected) return; // intentional close, or never up
+    this._connected = false;
+    for (const cb of [...this._closeListeners]) {
+      try {
+        cb();
+      } catch {
+        /* a broken watcher must not break disconnect handling */
+      }
+    }
   }
 
   async _handshake() {
@@ -147,6 +182,7 @@ export class CasparBridgeClient {
 
   close() {
     this._closed = true;
+    this._connected = false;
     const socket = this._socket;
     this._socket = null;
     if (socket) {

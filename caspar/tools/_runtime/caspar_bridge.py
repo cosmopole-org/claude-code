@@ -145,6 +145,19 @@ class CasparBridgeClient:
             except OSError:
                 pass
 
+    def is_connected(self) -> bool:
+        """True while the gateway link is live — the socket is open and the
+        reader thread is still running. A serving creature polls this so it can
+        notice a dropped connection and reconnect instead of sleeping on forever
+        unreachable (the "tool went cold and never woke up" failure)."""
+        reader = self._reader
+        return (
+            not self._closed.is_set()
+            and self._sock is not None
+            and reader is not None
+            and reader.is_alive()
+        )
+
     def __enter__(self) -> "CasparBridgeClient":
         return self.connect()
 
