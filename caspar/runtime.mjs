@@ -344,12 +344,19 @@ export function createDeliveryQueue(bridge, idleWaitMs, onQueued) {
     if (onQueued) onQueued(queue.length, delivery);
     if (notify) notify();
   });
+  // Wake a pending `next()` the instant the gateway link drops, so the serve
+  // loop reconnects promptly instead of blocking for the whole idle window.
+  const unsubClose = bridge.onClose ? bridge.onClose(() => notify && notify()) : () => {};
 
   return {
     get depth() {
       return queue.length;
     },
-    /** The next prompt, or `null` after `idleWaitMs` with nothing to serve. */
+    /**
+     * The next prompt, or `null` when there is nothing to serve — either the
+     * idle window elapsed or the gateway link dropped. The caller distinguishes
+     * the two with `bridge.isConnected()`.
+     */
     next() {
       return new Promise((resolve) => {
         if (queue.length) return resolve(queue.shift());
@@ -360,15 +367,41 @@ export function createDeliveryQueue(bridge, idleWaitMs, onQueued) {
         notify = () => {
           clearTimeout(timer);
           notify = null;
-          resolve(queue.shift());
+          resolve(queue.length ? queue.shift() : null);
         };
       });
     },
     dispose() {
       unsubscribe();
+      unsubClose();
       queue.length = 0;
     },
   };
+}
+
+/**
+ * Re-establish the gateway connection after it dropped, with capped exponential
+ * backoff. Returns a fresh connected bridge, or `null` if the gateway stays
+ * unreachable long enough that we should exit and let the node cold-spawn a
+ * fresh container.
+ */
+async function reconnectBridge(timeoutMs) {
+  const maxAttempts = Number(process.env.CLAUDE_CREATURE_RECONNECT_ATTEMPTS || 10);
+  let delayMs = 1000;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    try {
+      const bridge = await bridgeFromEnv({ timeoutMs });
+      if (bridge) {
+        log("CLAUDE_RECONNECTED", { attempt });
+        return bridge;
+      }
+    } catch (err) {
+      log("CLAUDE_RECONNECT", { attempt, of: maxAttempts, error: String(err?.message || err).slice(0, 160) });
+    }
+    delayMs = Math.min(delayMs * 2, 30000);
+  }
+  return null;
 }
 
 /** Offline self-test: read the task from the input dir instead of the gateway. */
@@ -421,15 +454,37 @@ export async function main() {
   const idleWaitMs = Number(process.env.CLAUDE_CREATURE_TASK_WAIT || 600) * 1000;
   let served = 0;
 
-  const deliveries = createDeliveryQueue(bridge, idleWaitMs, (depth, delivery) => {
+  const onQueued = (depth, delivery) => {
     if (depth > 1) log("CLAUDE_QUEUED", { depth, correlationId: delivery.correlationId });
-  });
+  };
+  const callTimeoutMs = Number(process.env.CLAUDE_CREATURE_CALL_TIMEOUT_MS || 60000);
+  let deliveries = createDeliveryQueue(bridge, idleWaitMs, onQueued);
 
   try {
     for (;;) {
       log("CLAUDE_READY", { machine_id: bridge.machineId, program_id: bridge.programId, served, queued: deliveries.depth, ts: Date.now() / 1000 });
       const delivery = await deliveries.next();
       if (!delivery) {
+        // A dropped gateway link looks like idle here, but the creature would be
+        // alive-and-unreachable (the node cannot fix a container it still sees
+        // as "running"), so reconnect instead of waiting on forever.
+        if (serveForever && !bridge.isConnected()) {
+          log("CLAUDE_RECONNECT", { served, reason: "gateway link lost" });
+          deliveries.dispose();
+          try {
+            bridge.close();
+          } catch {
+            /* already gone */
+          }
+          const next = await reconnectBridge(callTimeoutMs);
+          if (!next) {
+            log("CLAUDE_SERVE_UNAVAILABLE", { served, reason: "gateway link lost and could not be re-established — exiting so the node cold-spawns a fresh container" });
+            return 2;
+          }
+          bridge = next;
+          deliveries = createDeliveryQueue(bridge, idleWaitMs, onQueued);
+          continue;
+        }
         if (serveForever) {
           log("CLAUDE_IDLE", { served, waited_s: idleWaitMs / 1000 });
           continue; // immortal: keep waiting for the next prompt

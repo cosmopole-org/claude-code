@@ -487,6 +487,39 @@ await check("prompts that arrive while one is being served are queued, not dropp
   }
 });
 
+await check("a dropped gateway link wakes the serve loop instead of hanging until idle", async () => {
+  const gateway = await new FakeGateway().listen();
+  const bridge = await bridgeFromEnv({ env: { CASPAR_GATEWAY_HOST: "127.0.0.1", CASPAR_GATEWAY_PORT: String(gateway.port) }, timeoutMs: 5000 });
+  const { createDeliveryQueue } = await import("../runtime.mjs");
+  // A long idle window: only the disconnect (not the timeout) should wake next().
+  const queue = createDeliveryQueue(bridge, 30000);
+  try {
+    assert.equal(bridge.isConnected(), true, "connected after the handshake");
+    let closed = false;
+    bridge.onClose(() => {
+      closed = true;
+    });
+
+    // Block on the next prompt, then simulate the node/gateway dropping the link
+    // (node restart, transient blip). A serving creature that only polled on the
+    // idle window would sit here alive-but-unreachable; the link watch must wake
+    // it at once so it can reconnect.
+    const pending = queue.next();
+    for (const socket of [...gateway.sockets]) socket.destroy();
+
+    const started = Date.now();
+    const woke = await pending;
+    assert.equal(woke, null, "next() resolves null when the link drops (nothing to serve)");
+    assert.ok(Date.now() - started < 5000, "woke promptly on disconnect, not after the idle window");
+    assert.equal(closed, true, "onClose fired for the unexpected drop");
+    assert.equal(bridge.isConnected(), false, "isConnected() reflects the dropped link");
+  } finally {
+    queue.dispose();
+    bridge.close();
+    await gateway.close();
+  }
+});
+
 // ── end-to-end serve checks ─────────────────────────────────────────────────
 
 /**
