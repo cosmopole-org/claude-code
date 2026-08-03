@@ -182,6 +182,9 @@ var S = {
 // Retained widget handles we rebuild on state change.
 var W = {};
 
+// Retained handles for the compact desktop widget (widget mode only).
+var WW = {};
+
 // --------------------------------------------------------------------------- //
 // Data                                                                         //
 // --------------------------------------------------------------------------- //
@@ -480,10 +483,84 @@ function renderPreview() {
 }
 
 // --------------------------------------------------------------------------- //
+// Compact widget (desktop grid)                                                //
+// --------------------------------------------------------------------------- //
+
+// The client renders each tool as a square tile in the space "desktop" grid,
+// running this same front-end but with `__CTX.mode === "widget"`. In that mode
+// we draw a small stats card (folder/file counts for the sandbox home) instead
+// of the full explorer; tapping the tile re-runs us in `mode === "single"`,
+// which falls through to the full `build()` path below.
+function isWidgetMode() {
+  return ctx().mode === 'widget';
+}
+
+function buildWidget() {
+  T = theme();
+  var root = RN.column({
+    style: { flex: 1, backgroundColor: T.bg, padding: 12, justifyContent: 'space-between' }
+  });
+
+  var top = RN.row({ style: { alignItems: 'center' } });
+  top.add(RN.text('🗂️', { fontSize: 20, style: { marginRight: 8 } }));
+  var titleCol = RN.column({ style: { flex: 1 } });
+  titleCol.add(RN.text('Sandbox files', { color: T.text, fontSize: 14, fontWeight: '700' }));
+  titleCol.add(RN.text(ctx().sandboxName || 'the space machine', { color: T.muted, fontSize: 11 }));
+  top.add(titleCol);
+  root.add(top);
+
+  var statCol = RN.column({});
+  WW.count = RN.text('—', { color: T.accent, fontSize: 30, fontWeight: '800' });
+  statCol.add(WW.count);
+  WW.label = RN.text('Loading…', { color: T.muted, fontSize: 12 });
+  statCol.add(WW.label);
+  root.add(statCol);
+
+  root.add(RN.text('Tap to open', { color: T.muted, fontSize: 11 }));
+
+  RN.mount(root);
+  widgetRefresh();
+}
+
+function widgetRefresh() {
+  hostCall('list_dir', { path: '.' }, function (err, res) {
+    if (err != null || res == null || res.ok === false) {
+      if (WW.count != null) WW.count.set('text', '—');
+      if (WW.label != null) {
+        WW.label.set('text', 'sandbox unavailable');
+        WW.label.set('color', T.danger);
+      }
+      return;
+    }
+    var entries = res.entries || [];
+    var dirs = 0;
+    var files = 0;
+    var i = 0;
+    while (i < entries.length) {
+      if (entries[i].type === 'dir') dirs = dirs + 1;
+      else files = files + 1;
+      i = i + 1;
+    }
+    if (WW.count != null) WW.count.set('text', '' + entries.length);
+    if (WW.label != null) {
+      WW.label.set(
+        'text',
+        dirs + (dirs === 1 ? ' folder' : ' folders') + ' · ' + files + (files === 1 ? ' file' : ' files')
+      );
+      WW.label.set('color', T.muted);
+    }
+  });
+}
+
+// --------------------------------------------------------------------------- //
 // Boot                                                                         //
 // --------------------------------------------------------------------------- //
 
 function main() {
+  if (isWidgetMode()) {
+    buildWidget();
+    return;
+  }
   var start = ctx().startPath;
   if (typeof start === 'string' && start !== '' && start !== '.' && start !== '~') {
     // A relative start path below home.
