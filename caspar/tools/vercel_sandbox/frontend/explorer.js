@@ -30,8 +30,14 @@ var __hostCbs = {};
 // The host invokes this named global with [rid, ok, data] when a host.call
 // settles. Because each mini app is its own isolated VM, rid is purely our own
 // correlation key.
+//
+// rid is a STRING, not a number, and that is load-bearing: the Elpian VM keys
+// objects/maps by string only — assigning `__hostCbs[<int>]` traps the guest
+// ("__setIndex expects a string, got i64") *before* the askHost below ever runs,
+// so the file list would hang on "Loading…" forever. Coerce on the way in too,
+// in case the host echoes the id back as a number.
 function __hostReply(a) {
-  var rid = a[0];
+  var rid = '' + a[0];
   var ok = a[1];
   var data = a[2];
   var cb = __hostCbs[rid];
@@ -43,7 +49,7 @@ function __hostReply(a) {
 
 function hostCall(method, payload, cb) {
   __hostSeq = __hostSeq + 1;
-  var rid = __hostSeq;
+  var rid = '' + __hostSeq;
   __hostCbs[rid] = cb;
   askHost('host.call', [{ rid: rid, method: method, payload: payload }]);
 }
