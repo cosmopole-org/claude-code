@@ -509,7 +509,7 @@ function buildWidget() {
   top.add(titleCol);
   root.add(top);
 
-  var statCol = RN.column({});
+  var statCol = RN.column({ style: { marginVertical: 8 } });
   WW.count = RN.text('—', { color: T.accent, fontSize: 30, fontWeight: '800' });
   statCol.add(WW.count);
   WW.label = RN.text('Loading…', { color: T.muted, fontSize: 12 });
