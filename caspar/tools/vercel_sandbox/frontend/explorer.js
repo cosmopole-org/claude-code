@@ -184,6 +184,9 @@ function refresh() {
   S.loading = true;
   S.error = null;
   renderChrome();
+  // Reflect the loading state in the list too (spinner on first load, old
+  // contents kept during navigation), not just the status line.
+  renderList();
   var path = joinPath(S.parts);
   hostCall('list_dir', { path: path }, function (err, res) {
     S.loading = false;
