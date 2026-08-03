@@ -57,6 +57,13 @@
       }
     },
     {
+      "name": "list_dir",
+      "desc": "list the entries of a directory as structured {name, type, size} rows (directories first); read-only, powers the file-explorer front-end",
+      "args": {
+        "path": {"type": "STRING", "desc": "directory to list (default the sandbox home directory)"}
+      }
+    },
+    {
       "name": "info",
       "desc": "report the space's sandbox status, runtime, working directory and the public URLs of any exposed ports",
       "args": {

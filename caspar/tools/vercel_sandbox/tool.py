@@ -456,6 +456,60 @@ def _mkdir(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             "sandbox": sandbox_name(space_id), "session_id": session_id}
 
 
+# A POSIX-sh directory listing that emits one `type<TAB>size<TAB>name` row per
+# entry (dirs as `d`, everything else as `f`), so a front-end can build a file
+# explorer from one structured signal instead of parsing `ls` output. The path
+# rides in `$LIST_DIR` (an env var) to sidestep every shell-quoting hazard; a
+# missing/!directory target prints the single sentinel `__NODIR__`.
+_LIST_SCRIPT = r'''
+d="${LIST_DIR:-.}"
+cd "$d" 2>/dev/null || { printf '__NODIR__\n'; exit 0; }
+for e in * .*; do
+  [ "$e" = "." ] && continue
+  [ "$e" = ".." ] && continue
+  [ -e "$e" ] || [ -L "$e" ] || continue
+  if [ -d "$e" ]; then t=d; sz=0; else t=f; sz=$(wc -c < "$e" 2>/dev/null || printf 0); fi
+  printf '%s\t%s\t%s\n' "$t" "$sz" "$e"
+done
+'''
+
+
+def _list_dir(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Structured, read-only directory listing for a file-explorer front-end.
+
+    Runs the listing script through the ordinary exec path (so it shares the
+    space's session and auto-resume), then parses the tab-separated rows into
+    `{name, type, size}` entries with directories first.
+    """
+    path = str(payload.get("path") or payload.get("dir") or ".").strip() or "."
+    res = _exec(space_id, {"command": _LIST_SCRIPT,
+                           "env": {"LIST_DIR": path},
+                           "timeout_ms": int(payload.get("timeout_ms") or 15000)})
+    stdout = res.get("stdout") or ""
+    lines = [ln for ln in stdout.splitlines() if ln != ""]
+    if lines and lines[0].strip() == "__NODIR__":
+        return {"ok": False, "action": "list_dir", "space_id": space_id, "path": path,
+                "sandbox": sandbox_name(space_id), "error": "not a directory or not found"}
+    entries: List[Dict[str, Any]] = []
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        kind, size_str, name = parts[0], parts[1], "\t".join(parts[2:])
+        if not name:
+            continue
+        try:
+            size = int(size_str)
+        except (TypeError, ValueError):
+            size = 0
+        entries.append({"name": name, "type": "dir" if kind == "d" else "file", "size": size})
+    entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
+    return {"ok": True, "action": "list_dir", "space_id": space_id,
+            "sandbox": sandbox_name(space_id), "path": path,
+            "entries": entries, "count": len(entries),
+            "exit_code": res.get("exit_code")}
+
+
 # --------------------------------------------------------------------------- #
 # Actions
 # --------------------------------------------------------------------------- #
@@ -576,6 +630,10 @@ _ACTIONS = {
     "write": _write,
     "read": _read,
     "mkdir": _mkdir,
+    "list_dir": _list_dir,
+    "listdir": _list_dir,
+    "ls": _list_dir,
+    "readdir": _list_dir,
     "stop": _action_stop,
     "suspend": _action_stop,
     "delete": _action_delete,
