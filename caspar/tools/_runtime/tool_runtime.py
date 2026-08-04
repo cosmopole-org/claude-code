@@ -212,6 +212,14 @@ def _dispatch(tool_id: str, function: str, payload: dict) -> dict:
     # 1. Prefer the tool's real implementation when it ships with the image.
     impl = _load_tool_module()
     if impl is not None and hasattr(impl, "invoke"):
+        # Hand the tool the live gateway bridge when it wants one (opt-in via a
+        # `set_bridge` hook), so a tool can persist through the node's key/value
+        # store or signal siblings. Tools that don't declare it are unaffected.
+        if hasattr(impl, "set_bridge"):
+            try:
+                impl.set_bridge(_BRIDGE)
+            except Exception:  # noqa: BLE001 — never block dispatch on bridge wiring
+                pass
         try:
             return _call_invoke(impl, function, payload)
         except Exception:
