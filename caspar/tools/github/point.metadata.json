@@ -24,6 +24,7 @@
   "requires_network": true,
   "requiresNetwork": true,
   "bindSpace": true,
+  "autoAttach": false,
   "function": "status",
   "requiredArgs": ["function"],
   "categories": ["development", "execution"],
