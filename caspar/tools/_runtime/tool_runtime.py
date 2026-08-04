@@ -289,6 +289,19 @@ def _handle_invoke(bridge, packet: dict) -> None:
     tool_id = packet.get("tool_id") or TOOL_ID or "unknown"
     function = packet.get("function", "invoke")
     payload = packet.get("payload") or {}
+    # Stamp the TRUSTED caller identity onto the payload from the signal envelope.
+    # A caller's own arguments live under `payload`, so a guest could otherwise
+    # forge an identity by adding e.g. `caller_id` to its args; we therefore strip
+    # every caller-identity key the guest might have set and re-stamp `__caller_id`
+    # from the envelope's `reply_to`/`userId`, which the backend (Nest) sets from
+    # the authenticated user and a guest cannot influence. A tool that gates on the
+    # caller (e.g. github's per-member connection) reads `__caller_id`.
+    if isinstance(payload, dict):
+        for _k in ("__caller_id", "reply_to", "replyTo", "caller_id", "callerId", "user_id", "userId"):
+            payload.pop(_k, None)
+        _caller = packet.get("reply_to") or packet.get("userId")
+        if isinstance(_caller, str) and _caller.strip():
+            payload["__caller_id"] = _caller.strip()
     print(f"TOOL_BOOT {json.dumps({'tool_id': tool_id, 'function': function, 'ts': time.time()})}", flush=True)
     try:
         result = _dispatch(tool_id, function, payload)

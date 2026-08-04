@@ -271,10 +271,13 @@ def _space_id(payload: Dict[str, Any]) -> str:
 def _caller(payload: Dict[str, Any]) -> str:
     """The user id on whose behalf this call is made, as far as the tool can tell.
 
-    Nest signs a front-end call as the human user and passes ``reply_to``; an
-    agent turn carries the space/agent identity. Either way it is only *one* half
-    of the access decision — the other half is the stored owner + shared flag."""
-    for key in ("reply_to", "replyTo", "caller_id", "callerId", "user_id", "userId"):
+    The tool runtime stamps the trusted caller from the signal envelope as
+    ``__caller_id`` (Nest sets the envelope's ``reply_to`` from the authenticated
+    user; a guest cannot forge it). The remaining keys are only a fallback for
+    offline/unit runs that call :func:`invoke` directly. Either way this is only
+    *one* half of the access decision — the other half is the stored owner +
+    shared flag."""
+    for key in ("__caller_id", "reply_to", "replyTo", "caller_id", "callerId", "user_id", "userId"):
         val = payload.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
@@ -293,6 +296,24 @@ def _token_for(space_id: str) -> str:
     return token
 
 
+def _effective_owner(space_id: str, payload: Dict[str, Any], conn: Dict[str, Any]) -> str:
+    """The connection's owner, claiming it for the caller when unset.
+
+    A connection can end up with no recorded owner (e.g. connected before the
+    caller identity was propagated to the tool). Rather than lock everyone out,
+    the first authenticated caller **claims** ownership — self-healing, and a
+    no-op once an owner is set (which is the case for every new connection)."""
+    owner = str(conn.get("owner_user_id") or "")
+    if owner:
+        return owner
+    caller = _caller(payload)
+    if caller:
+        conn["owner_user_id"] = caller
+        _json_put(f"github/conn/{space_id}", conn)
+        return caller
+    return ""
+
+
 def _require_use(space_id: str, payload: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     """Authorise a data/action call and return (token, connection).
 
@@ -306,7 +327,7 @@ def _require_use(space_id: str, payload: Dict[str, Any]) -> Tuple[str, Dict[str,
                           status=409)
     if not conn.get("shared", False):
         caller = _caller(payload)
-        owner = str(conn.get("owner_user_id") or "")
+        owner = _effective_owner(space_id, payload, conn)
         if not caller or caller != owner:
             raise GithubError(
                 "this GitHub connection is private to the member who connected it; ask them to "
@@ -316,8 +337,9 @@ def _require_use(space_id: str, payload: Dict[str, Any]) -> Tuple[str, Dict[str,
 
 
 def _assert_owner(space_id: str, payload: Dict[str, Any], conn: Dict[str, Any], what: str) -> None:
+    owner = _effective_owner(space_id, payload, conn)
     caller = _caller(payload)
-    if caller and caller != str(conn.get("owner_user_id") or ""):
+    if owner and caller and caller != owner:
         raise GithubError(f"only the member who connected GitHub can {what}", status=403)
 
 
@@ -442,7 +464,10 @@ def _status(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not conn:
         return {"ok": True, "action": "status", "space_id": space_id, "connected": False}
     caller = _caller(payload)
-    is_owner = bool(caller) and caller == str(conn.get("owner_user_id") or "")
+    owner = str(conn.get("owner_user_id") or "")
+    # An unowned connection (legacy/broken connect) is claimable by any caller, so
+    # present them as the owner in the UI — the first use call makes it official.
+    is_owner = bool(caller) and (owner == "" or caller == owner)
     return {
         "ok": True, "action": "status", "space_id": space_id, "connected": True,
         "login": conn.get("login"), "name": conn.get("name"),
