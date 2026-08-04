@@ -11,6 +11,7 @@
   "response_point": "tool::vercel_sandbox::response",
   "risk_level": "high",
   "requires_network": true,
+  "autoAttach": true,
   "categories": [
     "execution"
   ],

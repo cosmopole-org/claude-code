@@ -7,14 +7,37 @@ repositories and drive git and GitHub (clone, branch, commit, push, pull, merge,
 open/merge pull requests, manage issues).
 
 ```
-Victor "GitHub" mini-app ──host.call──▶ Nest ──signal(as the user)──▶ github creature ──▶ GitHub
-     (the space desktop)                (space_id pinned)                  │  git + REST API
-space agents ──Davinci bridge──▶ signal(exec) ─────────────────────────────┘
+Victor "GitHub" mini-app ─host.call▶ Nest ─signal(as the user)▶ github creature ─REST▶ GitHub
+     (the space desktop)             (space_id + sandbox pinned)      │
+space agents ─Davinci bridge▶ signal ──────────────────────────────────┤
+                                                                        │ signal(exec/read/write)
+                                                          vercel_sandbox creature ─▶ the space's machine
 ```
 
 One creature serves **every** space; the binding is per-space state (the OAuth
 token one member connected), keyed by the space id, so nothing is deployed per
 space and any space that adds the tool from its tool-management page gets it.
+
+## The filesystem is the space's sandbox, not this container
+
+This creature keeps **no repository files of its own**. Every clone, fetch, pull,
+push, commit, branch, merge and every file read/write/delete happens on the
+space's **vercel_sandbox** creature — the same machine the space's agents and the
+Files desktop use — reached by signalling that creature over Caspar
+(`bridge.invoke_tool` → the sandbox's `exec`/`read`/`write`/`list_dir`). So a repo
+cloned here is on the one shared filesystem everyone in the space sees, under
+`~/github/<owner>__<repo>`. Git authenticates with the token passed to the sandbox
+**in the command's environment** (never in the command string or the repo's
+stored config).
+
+**Discovery is on Caspar, not through the backend.** The creature finds the
+sandbox itself, the same way the agent backbone discovers a space's tools: it
+reads the space store's members over the gateway (`readMembers`), fetches each
+member creature's descriptor (`getCreature`), and picks the space's **execution**
+tool (the sandbox). The result is cached briefly and re-resolved if a signal
+fails (e.g. the sandbox was re-minted). The NestJS proxy pins only the `space_id`
+on a call — it is never in the creature↔creature routing path, so the tool can
+only ever drive *its own* space's machine (the one that store's members list).
 
 ## Connecting (OAuth device flow)
 
@@ -61,7 +84,7 @@ the connection is gated. Only the owner can flip sharing or disconnect.
 | `commit` | stage + commit (`message`, optional `files`) |
 | `checkout` / `branch` / `merge` | branch + merge in the clone |
 | `git_status` / `git_log` | clone state |
-| `read_file` / `write_file` / `list_dir` / `list_cloned` | files in the clone |
+| `read_file` / `write_file` / `delete_file` / `list_dir` / `list_cloned` | files in the clone (on the sandbox) |
 
 Every action requires `space_id`, pinned by Nest for front-end calls and by the
 space membership for agents — a caller can never name another space.
