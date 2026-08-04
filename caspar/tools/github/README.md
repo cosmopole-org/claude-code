@@ -96,6 +96,12 @@ signal payload, so a prompt-injected agent cannot swap the OAuth app.
 | `GITHUB_OAUTH_CLIENT_ID` | the GitHub OAuth App / GitHub App client id (device flow **must** be enabled on it) |
 | `GITHUB_OAUTH_CLIENT_SECRET` | optional — device-flow public apps omit it |
 | `GITHUB_OAUTH_SCOPES` | default `repo,read:org,workflow,read:user` |
+
+> **CI note:** GitHub Actions forbids secret/variable names starting with the
+> reserved `GITHUB_` prefix. Provide the app under the `GH_OAUTH_CLIENT_ID`,
+> `GH_OAUTH_CLIENT_SECRET`, `GH_OAUTH_SCOPES` aliases — `ci-deploy.sh` and
+> `deploy_github_tool.py` map them to the `GITHUB_OAUTH_*` names above (a Docker
+> ENV has no such restriction).
 | `GITHUB_API_BASE` | default `https://api.github.com` (set for GitHub Enterprise) |
 | `GITHUB_WEB_BASE` | default `https://github.com` |
 | `GITHUB_MAX_OUTPUT` | chars of git/API output returned (60000) |
