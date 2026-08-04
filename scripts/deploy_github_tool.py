@@ -94,7 +94,24 @@ GITHUB_ENV_NAMES = (
 )
 
 
+# GitHub Actions forbids secret/variable names starting with the reserved GITHUB_
+# prefix, so the OAuth app may arrive under a GH_OAUTH_* alias. Map each alias to
+# the GITHUB_OAUTH_* name the image expects (the GITHUB_* spelling wins if set).
+_ALIASES = {
+    "GH_OAUTH_CLIENT_ID": "GITHUB_OAUTH_CLIENT_ID",
+    "GH_OAUTH_CLIENT_SECRET": "GITHUB_OAUTH_CLIENT_SECRET",
+    "GH_OAUTH_SCOPES": "GITHUB_OAUTH_SCOPES",
+}
+
+
+def _resolve_aliases() -> None:
+    for alias, target in _ALIASES.items():
+        if not os.environ.get(target, "").strip() and os.environ.get(alias, "").strip():
+            os.environ[target] = os.environ[alias].strip()
+
+
 def bake_env() -> Dict[str, str]:
+    _resolve_aliases()
     return {name: os.environ[name].strip() for name in GITHUB_ENV_NAMES if os.environ.get(name, "").strip()}
 
 
