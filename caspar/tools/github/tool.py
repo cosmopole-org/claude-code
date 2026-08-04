@@ -47,7 +47,6 @@ import base64
 import json
 import os
 import re
-import subprocess
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,13 +60,11 @@ HTTP_TIMEOUT = float(os.environ.get("GITHUB_HTTP_TIMEOUT", "45"))
 # Command output / API bodies are fed back into an LLM context and a mobile UI —
 # cap them hard so a huge diff or file listing can never blow either up.
 MAX_OUTPUT_CHARS = int(os.environ.get("GITHUB_MAX_OUTPUT", "60000"))
-MAX_READ_BYTES = int(os.environ.get("GITHUB_MAX_READ_BYTES", "1000000"))
-GIT_TIMEOUT = int(os.environ.get("GITHUB_GIT_TIMEOUT_S", "600"))
 API_PAGE_CAP = int(os.environ.get("GITHUB_API_PAGE_CAP", "300"))
 
-# Where cloned repositories (and the local state fallback) live inside the
-# container. Persists while the serving creature is warm; a cold restart simply
-# re-clones, and the token comes back from the node DB.
+# The container keeps NO repository files of its own — all clones live on the
+# space's sandbox (see the git/filesystem section). Only the OAuth token/connection
+# state falls back to a local file here when the node key/value store is absent.
 WORKSPACE = os.environ.get("GITHUB_WORKSPACE", "/workspace")
 STATE_DIR = os.path.join(WORKSPACE, ".state")
 
@@ -100,6 +97,15 @@ _BRIDGE = None  # set by set_bridge()
 def set_bridge(bridge) -> None:
     global _BRIDGE
     _BRIDGE = bridge
+
+
+def _bridge():
+    """The live gateway bridge, required to signal the space's sandbox creature."""
+    if _BRIDGE is None:
+        raise GithubError(
+            "the github creature is not connected to the node — repository work runs on the "
+            "space's sandbox over the gateway, which is unavailable here", status=503)
+    return _BRIDGE
 
 
 def _file_path(key: str) -> str:
@@ -737,275 +743,466 @@ def _number(payload: Dict[str, Any]) -> int:
     raise GithubError("a pull request / issue number is required")
 
 
-def _space_dir(space_id: str) -> str:
-    return os.path.join(WORKSPACE, _UNSAFE.sub("-", space_id).strip("-") or "space")
+# --------------------------------------------------------------------------- #
+# Git + filesystem — run on the space's vercel_sandbox creature over signalling
+# --------------------------------------------------------------------------- #
+#
+# The github tool NEVER touches its own container filesystem for repository work.
+# Every clone / fetch / pull / push / commit / branch / merge and every file
+# read/write/list happens on the space's **vercel_sandbox** creature — the same
+# machine the space's agents and the Files desktop use — reached by signalling
+# that creature over Caspar (bridge.invoke_tool). So a repo an agent clones here
+# is the repo everyone in the space sees, on one shared filesystem.
 
+SANDBOX_ENTITY = os.environ.get("GITHUB_SANDBOX_ENTITY", "vercel_sandbox")
+# Where clones live on the sandbox, relative to its home directory.
+REPO_ROOT = os.environ.get("GITHUB_SANDBOX_REPO_ROOT", "github")
+SANDBOX_TIMEOUT_S = int(os.environ.get("GITHUB_SANDBOX_TIMEOUT_S", "300"))
+_SANDBOX_TTL = float(os.environ.get("GITHUB_SANDBOX_CACHE_TTL", "300"))
 
-def _repo_dir(space_id: str, full: str) -> str:
-    return os.path.join(_space_dir(space_id), full.replace("/", "__"))
+# Discovered (space_id -> ({program_id, entity_id, creature_id}, deadline)). The
+# sandbox creature's id is resolved from the space itself over Caspar (see
+# _discover_sandbox), never handed to us by the backend, and cached briefly.
+_SANDBOX_CACHE: Dict[str, Tuple[Dict[str, str], float]] = {}
 
 
 def _auth_header(token: str) -> str:
-    """The ``http.extraheader`` value that authenticates git without ever writing
-    the token into the repo's stored remote URL or config."""
+    """The ``http.extraheader`` value that authenticates git without writing the
+    token into the repo's stored remote or config. Carried to the sandbox in the
+    command's environment, never in the command string itself."""
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     return f"AUTHORIZATION: basic {basic}"
 
 
-def _git(space_id: str, full: str, token: str, args: List[str], *,
-         cwd: Optional[str] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
-    """Run one git command with the token injected per-invocation.
+# --------------------------------------------------------------------------- #
+# Discovering the space's sandbox creature over Caspar (no backend involved)
+# --------------------------------------------------------------------------- #
+#
+# The github creature finds the space's sandbox itself, exactly the way the agent
+# backbone discovers a space's tools: read the space store's members over the
+# gateway, fetch each member creature's descriptor, and pick the one that is the
+# space's execution tool (the sandbox). Nothing is pinned by the NestJS proxy —
+# creature↔creature routing is resolved on Caspar and stays on Caspar.
 
-    The token rides in ``-c http.extraheader`` (never in the URL or on disk) and
-    a fixed identity is pinned so commits an agent makes are attributable."""
-    directory = cwd or _repo_dir(space_id, full)
-    base = [
-        "git",
-        "-c", f"http.{WEB_BASE}/.extraheader={_auth_header(token)}",
-        "-c", "credential.helper=",
-        "-c", "user.name=Decillion GitHub Tool",
-        "-c", "user.email=github-tool@decillion.local",
-        "-c", "safe.directory=*",
-    ]
+def _first_array(obj: Any, keys: List[str]) -> List[Any]:
+    if isinstance(obj, list):
+        return obj
+    if not isinstance(obj, dict):
+        return []
+    for k in keys:
+        if isinstance(obj.get(k), list):
+            return obj[k]
+    for k in ("result", "data", "obj", "value"):
+        if isinstance(obj.get(k), dict):
+            nested = _first_array(obj[k], keys)
+            if nested:
+                return nested
+    return []
+
+
+def _pick(entry: Dict[str, Any], keys: List[str]) -> str:
+    for k in keys:
+        v = entry.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _member_routing(entry: Any) -> Optional[Dict[str, str]]:
+    if not isinstance(entry, dict):
+        return None
+    creature_id = _pick(entry, ["creatureId", "creature_id", "userId", "user_id", "id"])
+    program_id = _pick(entry, ["programId", "program_id", "pid"])
+    entity_id = _pick(entry, ["entityId", "entity_id"])
+    if not creature_id and not program_id:
+        return None
+    return {"creature_id": creature_id, "program_id": program_id, "entity_id": entity_id}
+
+
+def _extract_descriptor(resp: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(resp, dict):
+        return None
+    roots = [resp, resp.get("obj"), resp.get("meta"), resp.get("metadata"),
+             resp.get("result"), resp.get("data"), resp.get("creature"), resp.get("record")]
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        pub = root.get("public")
+        d = (pub.get("decillion") if isinstance(pub, dict) else None) or root.get("decillion")
+        if not d and root.get("kind") and isinstance(root.get("usecases"), list):
+            d = root
+        if isinstance(d, dict) and d.get("kind"):
+            return d
+    return None
+
+
+def _is_sandbox_descriptor(d: Dict[str, Any]) -> bool:
+    """True when a member's descriptor is the space's sandbox (execution) tool."""
+    name = str(d.get("name") or "").lower()
+    tool_id = str(d.get("tool_id") or "").lower()
+    if "github" in name or "github" in tool_id:
+        return False  # never mistake ourselves for the sandbox
+    if "sandbox" in name or "vercel_sandbox" in tool_id:
+        return True
+    cats = [str(c).lower() for c in (d.get("categories") or [])]
+    return str(d.get("category") or "").lower() == "execution" or "execution" in cats
+
+
+def _read_members(space_id: str) -> List[Dict[str, str]]:
+    id_input = {"storeId": space_id, "id": space_id, "store": space_id, "storeID": space_id}
+    for op in ("readMembers", "listStoreMembers", "listStoreAccess", "listAccess"):
+        try:
+            resp = _bridge().call(op, id_input, timeout=15)
+        except Exception:  # noqa: BLE001 — try the next alias
+            continue
+        rows = _first_array(resp, ["members", "list", "access", "creatures", "results", "items", "entries"])
+        members = [m for m in (_member_routing(r) for r in rows) if m]
+        if members:
+            return members
+    return []
+
+
+def _discover_sandbox(space_id: str) -> Optional[Dict[str, str]]:
+    """Resolve the space's sandbox creature routing, cached briefly."""
+    now = time.monotonic()
+    cached = _SANDBOX_CACHE.get(space_id)
+    if cached and cached[1] > now:
+        return cached[0]
+    self_pid = getattr(_BRIDGE, "program_id", "") or ""
+    for m in _read_members(space_id):
+        if m["program_id"] and m["program_id"] == self_pid:
+            continue  # skip ourselves
+        ident = m["creature_id"] or m["program_id"]
+        try:
+            resp = _bridge().call("getCreature", {"userId": ident, "creatureId": ident}, timeout=15)
+        except Exception:  # noqa: BLE001
+            continue
+        descriptor = _extract_descriptor(resp)
+        if descriptor and _is_sandbox_descriptor(descriptor):
+            route = {"program_id": m["program_id"] or ident,
+                     "creature_id": m["creature_id"],
+                     "entity_id": m["entity_id"] or SANDBOX_ENTITY}
+            _SANDBOX_CACHE[space_id] = (route, now + _SANDBOX_TTL)
+            return route
+    return None
+
+
+def _invalidate_sandbox(space_id: str) -> None:
+    _SANDBOX_CACHE.pop(space_id, None)
+
+
+def _sandbox_route(space_id: str, payload: Dict[str, Any]) -> Tuple[str, str]:
+    """The space sandbox creature's (program id, entity id) to signal.
+
+    Discovered from the space over Caspar (:func:`_discover_sandbox`). An explicit
+    ``sandbox_program_id`` in the payload is honoured only as an override/escape
+    hatch (e.g. tests) — the normal path resolves it on-chain, so the backend is
+    never in the creature↔creature routing path."""
+    pid = (payload.get("sandbox_program_id") or payload.get("sandboxProgramId") or "")
+    if isinstance(pid, str) and pid.strip():
+        ent = (payload.get("sandbox_entity_id") or payload.get("sandboxEntityId") or SANDBOX_ENTITY)
+        return pid.strip(), str(ent or SANDBOX_ENTITY)
+    route = _discover_sandbox(space_id)
+    if not route:
+        raise GithubError(
+            "could not find this space's sandbox — repository work runs on the space's cloud "
+            "machine, which does not appear among the space's creatures yet", status=409)
+    return route["program_id"], route["entity_id"]
+
+
+def _sbx(space_id: str, payload: Dict[str, Any], function: str, args: Dict[str, Any],
+         *, timeout: Optional[float] = None) -> Dict[str, Any]:
+    """Signal the space's sandbox creature and return its action result.
+
+    Re-discovers the sandbox once if the signal fails (e.g. it was re-minted), so
+    a stale cached id self-heals instead of failing every call."""
+    body = dict(args)
+    body["space_id"] = space_id
+    wait = (timeout or SANDBOX_TIMEOUT_S) + 30
+    pid, ent = _sandbox_route(space_id, payload)
     try:
-        proc = subprocess.run(base + args, cwd=directory if os.path.isdir(directory) else None,
-                              capture_output=True, text=True, timeout=timeout or GIT_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise GithubError(f"git {' '.join(args[:2])} timed out after {timeout or GIT_TIMEOUT}s", status=504)
-    except FileNotFoundError:
-        raise GithubError("git is not installed in the creature image", status=500)
-    out = _clip(proc.stdout or "")
-    # Never echo the Authorization header back if git logged the argv.
-    err = _clip((proc.stderr or "").replace(_auth_header(token), "AUTHORIZATION: basic ***"))
-    return {"exit_code": proc.returncode, "stdout": out, "stderr": err}
+        reply = _bridge().invoke_tool(pid, ent, function, body, tool_id=SANDBOX_ENTITY, timeout=wait)
+    except Exception:  # noqa: BLE001 — one retry against a freshly-discovered sandbox
+        _invalidate_sandbox(space_id)
+        if payload.get("sandbox_program_id"):
+            raise
+        route = _discover_sandbox(space_id)
+        if not route:
+            raise
+        reply = _bridge().invoke_tool(route["program_id"], route["entity_id"], function, body,
+                                      tool_id=SANDBOX_ENTITY, timeout=wait)
+    # invoke_tool returns the tool runtime envelope {tool_id, function, result};
+    # unwrap to the sandbox action's own result. Tolerate a bare result too.
+    if isinstance(reply, dict):
+        inner = reply.get("result")
+        if isinstance(inner, dict):
+            return inner
+        return reply
+    raise GithubError("the sandbox creature did not reply", status=504)
+
+
+def _sbx_exec(space_id: str, payload: Dict[str, Any], command: str, *,
+              env: Optional[Dict[str, str]] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
+    """Run a shell line on the space's sandbox and return {exit_code, stdout, stderr}."""
+    t = timeout or SANDBOX_TIMEOUT_S
+    args: Dict[str, Any] = {"command": command, "timeout_ms": int(t * 1000)}
+    if env:
+        args["env"] = {str(k): str(v) for k, v in env.items()}
+    res = _sbx(space_id, payload, "exec", args, timeout=t)
+    if res.get("error") and res.get("exit_code") is None:
+        raise GithubError(f"sandbox exec failed: {res.get('error')}", status=502)
+    return res
+
+
+def _git_env(token: str) -> Dict[str, str]:
+    # The token rides in the environment (GH_XHDR), so it is never part of the
+    # command string the sandbox logs or echoes.
+    return {"GH_XHDR": _auth_header(token), "GH_BASE": WEB_BASE}
+
+
+def _git() -> str:
+    """The git invocation prefix: auth via the GH_XHDR env, no stored credentials,
+    a fixed identity, and every clone dir trusted."""
+    return ('git -c "http.${GH_BASE}/.extraheader=${GH_XHDR}" -c credential.helper= '
+            '-c user.name="Decillion GitHub Tool" -c user.email=github-tool@decillion.local '
+            '-c safe.directory=* ')
+
+
+def _repo_path(full: str) -> str:
+    """The clone directory for a repo on the sandbox (under REPO_ROOT)."""
+    return REPO_ROOT + "/" + full.replace("/", "__")
+
+
+def _rel(path: str) -> str:
+    """A repo-relative path with traversal rejected."""
+    p = str(path or "").strip().lstrip("/")
+    parts = []
+    for seg in p.replace("\\", "/").split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            raise GithubError("path escapes the repository", status=400)
+        parts.append(seg)
+    return "/".join(parts)
+
+
+def _sh(s: str) -> str:
+    """Single-quote a string for safe inclusion in the sandbox shell line."""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def _scrub(res: Dict[str, Any], token: str) -> None:
+    hdr = _auth_header(token)
+    for k in ("stdout", "stderr", "output"):
+        if isinstance(res.get(k), str):
+            res[k] = res[k].replace(hdr, "AUTHORIZATION: basic ***")
+
+
+def _exec_result(res: Dict[str, Any], action: str, space_id: str, full: str) -> Dict[str, Any]:
+    return {"ok": res.get("exit_code") == 0, "action": action, "space_id": space_id, "repo": full,
+            "exit_code": res.get("exit_code"), "stdout": _clip(res.get("stdout") or ""),
+            "stderr": _clip(res.get("stderr") or "")}
 
 
 def _a_clone(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token, _ = _require_use(space_id, payload)
     full = _full_name(payload)
-    directory = _repo_dir(space_id, full)
-    os.makedirs(_space_dir(space_id), exist_ok=True)
+    rp = _repo_path(full)
     url = f"{WEB_BASE}/{full}.git"
-    if os.path.isdir(os.path.join(directory, ".git")):
-        res = _git(space_id, full, token, ["fetch", "--all", "--prune"])
-        cloned = False
-    else:
-        args = ["clone"]
-        if payload.get("depth"):
-            args += ["--depth", str(int(payload["depth"]))]
-        if payload.get("branch"):
-            args += ["--branch", _slug(payload["branch"])]
-        args += [url, directory]
-        res = _git(space_id, full, token, args, cwd=_space_dir(space_id))
-        cloned = True
-    if res["exit_code"] != 0:
-        raise GithubError(f"git clone/fetch failed: {res['stderr'] or res['stdout']}", status=502)
-    return {"ok": True, "action": "clone", "space_id": space_id, "repo": full,
-            "path": directory, "cloned": cloned, "output": res["stderr"] or res["stdout"]}
+    depth = f"--depth {int(payload['depth'])}" if payload.get("depth") else ""
+    branch = f"--branch {_slug(payload['branch'])}" if payload.get("branch") else ""
+    # Idempotent: fetch when already cloned, else clone. All under REPO_ROOT.
+    cmd = (f"mkdir -p {_sh(REPO_ROOT)} && "
+           f"if [ -d {_sh(rp + '/.git')} ]; then cd {_sh(rp)} && {_git()}fetch --all --prune; "
+           f"else {_git()}clone {depth} {branch} {url} {_sh(rp)}; fi")
+    res = _sbx_exec(space_id, payload, cmd, env=_git_env(token))
+    _scrub(res, token)
+    if res.get("exit_code") != 0:
+        raise GithubError(f"git clone/fetch failed: {res.get('stderr') or res.get('stdout')}", status=502)
+    return {"ok": True, "action": "clone", "space_id": space_id, "repo": full, "path": rp,
+            "output": _clip(res.get("stderr") or res.get("stdout") or "")}
 
 
-def _ensure_cloned(space_id: str, full: str) -> str:
-    directory = _repo_dir(space_id, full)
-    if not os.path.isdir(os.path.join(directory, ".git")):
+def _run_git(space_id: str, payload: Dict[str, Any], action: str, git_args: str,
+             token: str, *, require_clone: bool = True) -> Dict[str, Any]:
+    full = _full_name(payload)
+    rp = _repo_path(full)
+    guard = (f"if [ ! -d {_sh(rp + '/.git')} ]; then echo __NOCLONE__ 1>&2; exit 3; fi && "
+             if require_clone else "")
+    cmd = f"{guard}cd {_sh(rp)} && {_git()}{git_args}"
+    res = _sbx_exec(space_id, payload, cmd, env=_git_env(token))
+    _scrub(res, token)
+    if require_clone and res.get("exit_code") == 3 and "__NOCLONE__" in (res.get("stderr") or ""):
         raise GithubError(f"{full} is not cloned into this space yet — clone it first", status=409)
-    return directory
+    return _exec_result(res, action, space_id, full)
 
 
 def _a_pull(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token, _ = _require_use(space_id, payload)
-    full = _full_name(payload)
-    _ensure_cloned(space_id, full)
-    args = ["pull", "origin"] + ([_slug(payload["branch"])] if payload.get("branch") else [])
-    res = _git(space_id, full, token, args)
-    return {"ok": res["exit_code"] == 0, "action": "pull", "space_id": space_id, "repo": full,
-            "exit_code": res["exit_code"], "stdout": res["stdout"], "stderr": res["stderr"]}
+    branch = f" {_slug(payload['branch'])}" if payload.get("branch") else ""
+    return _run_git(space_id, payload, "pull", f"pull origin{branch}", token)
 
 
 def _a_fetch(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token, _ = _require_use(space_id, payload)
-    full = _full_name(payload)
-    _ensure_cloned(space_id, full)
-    res = _git(space_id, full, token, ["fetch", "--all", "--prune"])
-    return {"ok": res["exit_code"] == 0, "action": "fetch", "space_id": space_id, "repo": full,
-            "exit_code": res["exit_code"], "stdout": res["stdout"], "stderr": res["stderr"]}
+    return _run_git(space_id, payload, "fetch", "fetch --all --prune", token)
 
 
 def _a_commit(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token, _ = _require_use(space_id, payload)
-    full = _full_name(payload)
-    _ensure_cloned(space_id, full)
     message = str(payload.get("message") or "").strip()
     if not message:
         raise GithubError("commit needs a `message`")
-    add_args = ["add"]
     files = payload.get("files")
     if isinstance(files, list) and files:
-        add_args += ["--"] + [str(f) for f in files]
+        add = "add -- " + " ".join(_sh(str(f)) for f in files)
     else:
-        add_args.append("-A")
-    add = _git(space_id, full, token, add_args)
-    if add["exit_code"] != 0:
-        raise GithubError(f"git add failed: {add['stderr']}", status=502)
-    commit = _git(space_id, full, token, ["commit", "-m", message])
-    return {"ok": commit["exit_code"] == 0, "action": "commit", "space_id": space_id, "repo": full,
-            "exit_code": commit["exit_code"], "stdout": commit["stdout"], "stderr": commit["stderr"]}
+        add = "add -A"
+    full = _full_name(payload)
+    rp = _repo_path(full)
+    # Stage then commit; the message rides in the environment to avoid quoting.
+    cmd = (f"if [ ! -d {_sh(rp + '/.git')} ]; then echo __NOCLONE__ 1>&2; exit 3; fi && "
+           f"cd {_sh(rp)} && {_git()}{add} && {_git()}commit -m \"$GH_MSG\"")
+    env = _git_env(token); env["GH_MSG"] = message
+    res = _sbx_exec(space_id, payload, cmd, env=env)
+    _scrub(res, token)
+    if res.get("exit_code") == 3 and "__NOCLONE__" in (res.get("stderr") or ""):
+        raise GithubError(f"{full} is not cloned into this space yet — clone it first", status=409)
+    return _exec_result(res, "commit", space_id, full)
 
 
 def _a_push(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token, _ = _require_use(space_id, payload)
-    full = _full_name(payload)
-    _ensure_cloned(space_id, full)
     if payload.get("branch"):
-        args = ["push", "origin", _slug(payload["branch"])]
+        ref = f"origin {_slug(payload['branch'])}"
     elif payload.get("set_upstream"):
-        args = ["push", "-u", "origin", "HEAD"]
+        ref = "-u origin HEAD"
     else:
-        args = ["push", "origin", "HEAD"]
-    if payload.get("force"):
-        args.insert(1, "--force-with-lease")
-    res = _git(space_id, full, token, args)
-    if res["exit_code"] != 0:
-        raise GithubError(f"git push failed: {res['stderr'] or res['stdout']}", status=502)
-    return {"ok": True, "action": "push", "space_id": space_id, "repo": full,
-            "stdout": res["stdout"], "stderr": res["stderr"]}
+        ref = "origin HEAD"
+    force = "--force-with-lease " if payload.get("force") else ""
+    out = _run_git(space_id, payload, "push", f"push {force}{ref}", token)
+    if not out["ok"]:
+        raise GithubError(f"git push failed: {out.get('stderr') or out.get('stdout')}", status=502)
+    return out
 
 
 def _a_checkout(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token, _ = _require_use(space_id, payload)
-    full = _full_name(payload)
-    _ensure_cloned(space_id, full)
     branch = str(payload.get("branch") or "").strip()
     if not branch:
         raise GithubError("checkout needs a `branch`")
-    args = ["checkout"]
-    if payload.get("create"):
-        args.append("-b")
-    args.append(_slug(branch))
-    if payload.get("start_point"):
-        args.append(_slug(payload["start_point"]))
-    res = _git(space_id, full, token, args)
-    if res["exit_code"] != 0:
-        raise GithubError(f"git checkout failed: {res['stderr'] or res['stdout']}", status=502)
-    return {"ok": True, "action": "checkout", "space_id": space_id, "repo": full, "branch": branch,
-            "stdout": res["stdout"], "stderr": res["stderr"]}
+    flag = "-b " if payload.get("create") else ""
+    start = f" {_slug(payload['start_point'])}" if payload.get("start_point") else ""
+    out = _run_git(space_id, payload, "checkout", f"checkout {flag}{_slug(branch)}{start}", token)
+    if not out["ok"]:
+        raise GithubError(f"git checkout failed: {out.get('stderr') or out.get('stdout')}", status=502)
+    out["branch"] = branch
+    return out
 
 
 def _a_merge(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token, _ = _require_use(space_id, payload)
-    full = _full_name(payload)
-    _ensure_cloned(space_id, full)
     branch = str(payload.get("branch") or payload.get("from") or "").strip()
     if not branch:
         raise GithubError("merge needs a `branch` to merge in")
-    res = _git(space_id, full, token, ["merge", _slug(branch)])
-    return {"ok": res["exit_code"] == 0, "action": "merge", "space_id": space_id, "repo": full,
-            "exit_code": res["exit_code"], "stdout": res["stdout"], "stderr": res["stderr"]}
+    return _run_git(space_id, payload, "merge", f"merge {_slug(branch)}", token)
 
 
 def _a_git_status(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token, _ = _require_use(space_id, payload)
     full = _full_name(payload)
-    _ensure_cloned(space_id, full)
-    st = _git(space_id, full, token, ["status", "--porcelain=v1", "--branch"])
-    branch = _git(space_id, full, token, ["rev-parse", "--abbrev-ref", "HEAD"])
-    body_lines = [ln for ln in (st["stdout"] or "").splitlines() if not ln.startswith("##")]
-    return {"ok": True, "action": "git_status", "space_id": space_id, "repo": full,
-            "branch": (branch["stdout"] or "").strip(),
-            "status": st["stdout"], "dirty": bool(body_lines)}
+    rp = _repo_path(full)
+    cmd = (f"if [ ! -d {_sh(rp + '/.git')} ]; then echo __NOCLONE__ 1>&2; exit 3; fi && "
+           f"cd {_sh(rp)} && {_git()}rev-parse --abbrev-ref HEAD && echo '---' && "
+           f"{_git()}status --porcelain=v1")
+    res = _sbx_exec(space_id, payload, cmd, env=_git_env(token))
+    _scrub(res, token)
+    if res.get("exit_code") == 3 and "__NOCLONE__" in (res.get("stderr") or ""):
+        raise GithubError(f"{full} is not cloned into this space yet — clone it first", status=409)
+    out = res.get("stdout") or ""
+    branch, _, status = out.partition("\n---\n")
+    body = [ln for ln in status.splitlines() if ln.strip()]
+    return {"ok": res.get("exit_code") == 0, "action": "git_status", "space_id": space_id,
+            "repo": full, "branch": branch.strip(), "status": status, "dirty": bool(body)}
 
 
 def _a_git_log(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token, _ = _require_use(space_id, payload)
-    full = _full_name(payload)
-    _ensure_cloned(space_id, full)
     n = int(payload.get("limit") or 20)
-    res = _git(space_id, full, token, ["log", f"-{n}", "--pretty=format:%h%x09%an%x09%ad%x09%s", "--date=short"])
+    out = _run_git(space_id, payload, "git_log",
+                   f"log -{n} --pretty=format:%h%x09%an%x09%ad%x09%s --date=short", token)
     commits = []
-    for line in (res["stdout"] or "").splitlines():
+    for line in (out.get("stdout") or "").splitlines():
         parts = line.split("\t")
         if len(parts) >= 4:
             commits.append({"sha": parts[0], "author": parts[1], "date": parts[2], "message": parts[3]})
-    return {"ok": True, "action": "git_log", "space_id": space_id, "repo": full, "commits": commits}
+    return {"ok": out["ok"], "action": "git_log", "space_id": space_id,
+            "repo": _full_name(payload), "commits": commits}
 
 
 def _a_list_cloned(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     _require_use(space_id, payload)
-    base = _space_dir(space_id)
-    repos: List[Dict[str, Any]] = []
-    if os.path.isdir(base):
-        for name in sorted(os.listdir(base)):
-            directory = os.path.join(base, name)
-            if os.path.isdir(os.path.join(directory, ".git")):
-                repos.append({"repo": name.replace("__", "/"), "path": directory})
+    res = _sbx(space_id, payload, "list_dir", {"path": REPO_ROOT})
+    repos = []
+    for e in (res.get("entries") or []):
+        if isinstance(e, dict) and e.get("type") == "dir" and e.get("name"):
+            repos.append({"repo": str(e["name"]).replace("__", "/"),
+                          "path": REPO_ROOT + "/" + str(e["name"])})
     return {"ok": True, "action": "list_cloned", "space_id": space_id, "repos": repos, "count": len(repos)}
-
-
-def _safe_join(directory: str, rel: str) -> str:
-    target = os.path.realpath(os.path.join(directory, rel))
-    if target != os.path.realpath(directory) and not target.startswith(os.path.realpath(directory) + os.sep):
-        raise GithubError("path escapes the repository", status=400)
-    return target
 
 
 def _a_read_file(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     _require_use(space_id, payload)
     full = _full_name(payload)
-    directory = _ensure_cloned(space_id, full)
-    rel = str(payload.get("path") or "").strip()
+    rel = _rel(payload.get("path") or "")
     if not rel:
         raise GithubError("read_file needs a `path`")
-    target = _safe_join(directory, rel)
-    if not os.path.isfile(target):
-        raise GithubError(f"no such file: {rel}", status=404)
-    with open(target, "rb") as fh:
-        data = fh.read(MAX_READ_BYTES)
-    try:
-        return {"ok": True, "action": "read_file", "space_id": space_id, "repo": full, "path": rel,
-                "content": _clip(data.decode("utf-8")), "encoding": "text", "bytes": len(data)}
-    except UnicodeDecodeError:
-        return {"ok": True, "action": "read_file", "space_id": space_id, "repo": full, "path": rel,
-                "content": base64.b64encode(data).decode("ascii"), "encoding": "base64", "bytes": len(data)}
+    res = _sbx(space_id, payload, "read", {"path": _repo_path(full) + "/" + rel})
+    if res.get("ok") is False:
+        raise GithubError(res.get("error") or f"could not read {rel}", status=res.get("status") or 404)
+    return {"ok": True, "action": "read_file", "space_id": space_id, "repo": full, "path": rel,
+            "content": res.get("content"), "encoding": res.get("encoding", "text"),
+            "bytes": res.get("bytes")}
 
 
 def _a_write_file(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     _require_use(space_id, payload)
     full = _full_name(payload)
-    directory = _ensure_cloned(space_id, full)
-    rel = str(payload.get("path") or "").strip()
+    rel = _rel(payload.get("path") or "")
     if not rel:
         raise GithubError("write_file needs a `path`")
-    target = _safe_join(directory, rel)
-    content = payload.get("content", "")
-    if str(payload.get("encoding") or "text").lower() == "base64":
-        data = base64.b64decode(content or "")
-    else:
-        data = str(content).encode("utf-8")
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    with open(target, "wb") as fh:
-        fh.write(data)
+    args = {"path": _repo_path(full) + "/" + rel, "content": payload.get("content", ""),
+            "encoding": payload.get("encoding", "text")}
+    res = _sbx(space_id, payload, "write", args)
+    if res.get("ok") is False:
+        raise GithubError(res.get("error") or f"could not write {rel}", status=res.get("status") or 502)
     return {"ok": True, "action": "write_file", "space_id": space_id, "repo": full, "path": rel,
-            "bytes": len(data)}
+            "bytes": res.get("bytes")}
+
+
+def _a_delete_file(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    token, _ = _require_use(space_id, payload)
+    full = _full_name(payload)
+    rel = _rel(payload.get("path") or "")
+    if not rel:
+        raise GithubError("delete_file needs a `path`")
+    rp = _repo_path(full)
+    res = _sbx_exec(space_id, payload, f"cd {_sh(rp)} && rm -rf {_sh(rel)}")
+    return {"ok": res.get("exit_code") == 0, "action": "delete_file", "space_id": space_id,
+            "repo": full, "path": rel, "stderr": _clip(res.get("stderr") or "")}
 
 
 def _a_list_dir(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Structured listing of a directory inside a cloned repo, for the UI."""
     _require_use(space_id, payload)
     full = _full_name(payload)
-    directory = _ensure_cloned(space_id, full)
-    rel = str(payload.get("path") or ".").strip() or "."
-    target = _safe_join(directory, rel)
-    if not os.path.isdir(target):
-        raise GithubError("not a directory", status=404)
-    entries = []
-    for name in os.listdir(target):
-        if name == ".git":
-            continue
-        p = os.path.join(target, name)
-        is_dir = os.path.isdir(p)
-        entries.append({"name": name, "type": "dir" if is_dir else "file",
-                        "size": 0 if is_dir else os.path.getsize(p)})
-    entries.sort(key=lambda e: (e["type"] != "dir", e["name"].lower()))
-    return {"ok": True, "action": "list_dir", "space_id": space_id, "repo": full, "path": rel,
+    rel = _rel(payload.get("path") or ".")
+    base = _repo_path(full)
+    path = base + ("/" + rel if rel else "")
+    res = _sbx(space_id, payload, "list_dir", {"path": path})
+    if res.get("ok") is False:
+        raise GithubError(res.get("error") or "could not list", status=res.get("status") or 404)
+    entries = [e for e in (res.get("entries") or []) if isinstance(e, dict) and e.get("name") != ".git"]
+    return {"ok": True, "action": "list_dir", "space_id": space_id, "repo": full, "path": rel or ".",
             "entries": entries, "count": len(entries)}
 
 
@@ -1048,6 +1245,7 @@ _ACTIONS = {
     "git_status": _a_git_status, "status_repo": _a_git_status, "git_log": _a_git_log,
     "list_cloned": _a_list_cloned,
     "read_file": _a_read_file, "write_file": _a_write_file,
+    "delete_file": _a_delete_file, "rm": _a_delete_file,
     "list_dir": _a_list_dir, "ls": _a_list_dir,
 }
 

@@ -90,6 +90,11 @@ class CasparBridgeClient:
         self._next_id = 1
         self._pending: Dict[int, threading.Event] = {}
         self._results: Dict[int, Any] = {}
+        # Waiters for creature→creature tool invocations (invoke_tool), keyed by
+        # correlationId. A `tools/result` push matching one is resolved here (on
+        # the reader thread) and never reaches the signal handler.
+        self._tool_waiters: Dict[str, threading.Event] = {}
+        self._tool_results: Dict[str, Any] = {}
         self._pending_lock = threading.Lock()
         self._partials: Dict[int, Dict[str, Any]] = {}
         self._signal_handler: Optional[SignalHandler] = None
@@ -225,6 +230,71 @@ class CasparBridgeClient:
         return self.call("signalUser", {"key": key, "userId": user_id,
                                         "packet": packet if isinstance(packet, str) else json.dumps(packet)})
 
+    def invoke_tool(self, target: str, entity_id: str, function: str, payload: Any, *,
+                    tool_id: Optional[str] = None, timeout: Optional[float] = None) -> Any:
+        """Employ a sibling tool creature over the gateway and await its result.
+
+        Pushes a `creatures/signal` invoke packet to ``target`` (the tool's program
+        id — the node delivers it to that container, cold-spawning when none is
+        live) and blocks until the tool replies with a `tools/result` carrying the
+        same ``correlationId``. Mirrors the agent backbone's ToolInvoker; the reply
+        is routed back to us because ``reply_to`` is this creature's own id. Returns
+        the tool's ``result`` object (`{tool_id, function, result}`)."""
+        import uuid
+        cid = uuid.uuid4().hex
+        ev = threading.Event()
+        with self._pending_lock:
+            self._tool_waiters[cid] = ev
+        packet = {
+            "kind": "invoke",
+            "entityId": entity_id,
+            "correlationId": cid,
+            # The sandbox tool replies to this via signalUser; machineId (else
+            # programId) is what the node routes back to our connection.
+            "reply_to": self.machine_id or self.program_id,
+            "tool_id": tool_id or entity_id,
+            "function": function,
+            "payload": payload,
+        }
+        try:
+            self.signal_user("creatures/signal", str(target), packet)
+        except Exception:
+            with self._pending_lock:
+                self._tool_waiters.pop(cid, None)
+            raise
+        wait = timeout if timeout is not None else self.timeout * 4
+        if not ev.wait(wait):
+            with self._pending_lock:
+                self._tool_waiters.pop(cid, None)
+                self._tool_results.pop(cid, None)
+            raise BridgeError(f"tool '{entity_id}' did not reply within {wait:.0f}s")
+        with self._pending_lock:
+            return self._tool_results.pop(cid, None)
+
+    def _maybe_resolve_tool(self, key: str, data: Any) -> bool:
+        """Resolve a pending :func:`invoke_tool` waiter from a `tools/result` push.
+
+        Returns True (consuming the signal) when it matched a waiter, so a tool
+        result meant for us is never handed to the serve-loop signal handler."""
+        if key != "creatures/signal":
+            return False
+        packet = data
+        if isinstance(packet, dict) and isinstance(packet.get("data"), str):
+            try:
+                packet = json.loads(packet["data"])
+            except (TypeError, ValueError):
+                return False
+        if not isinstance(packet, dict) or packet.get("kind") != "tools/result":
+            return False
+        cid = str(packet.get("correlationId") or "")
+        with self._pending_lock:
+            ev = self._tool_waiters.pop(cid, None)
+            if ev is None:
+                return False
+            self._tool_results[cid] = packet.get("result")
+        ev.set()
+        return True
+
     def signal_group(self, key: str, group_id: str, packet: Any, except_ids: Optional[list] = None) -> Any:
         return self.call("signalGroup", {"key": key, "groupId": group_id,
                                          "packet": packet if isinstance(packet, str) else json.dumps(packet),
@@ -351,6 +421,10 @@ class CasparBridgeClient:
             if not isinstance(value, dict):
                 return
             key, data = value.get("key", ""), value.get("data")
+            # A reply to one of our own invoke_tool calls is resolved here and not
+            # delivered to the serve handler (which would ignore it anyway).
+            if self._maybe_resolve_tool(key, data):
+                return
             handler = self._signal_handler
             if handler is None:
                 # No handler yet: buffer for replay when one registers, so a flush

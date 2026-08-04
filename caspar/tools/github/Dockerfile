@@ -4,16 +4,13 @@
 # + requirements). The GitHub OAuth app credentials are baked in as ENV by the
 # deploy harness — they are never read from a signal payload.
 #
-# Unlike a pure-API tool this image needs a real `git` on PATH: the tool clones
-# repositories into a per-space workspace and drives push/pull/merge locally.
+# No `git` is installed here on purpose: the tool never touches its own
+# filesystem for repository work — every clone/commit/push and every file
+# read/write happens on the space's vercel_sandbox creature, driven over Caspar
+# signalling. This image only makes GitHub REST calls and signals the sandbox.
 FROM public.ecr.aws/docker/library/python:3.12-slim
 
 WORKDIR /app
-
-# git + certificates for cloning over HTTPS.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir \
