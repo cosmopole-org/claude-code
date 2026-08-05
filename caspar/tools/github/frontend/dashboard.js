@@ -13,13 +13,14 @@
 //     the logged-in user, and delivers the reply via __hostReply.
 //   * hostCall("host:openUrl", { url }, cb) is a CLIENT capability, handled in
 //     VictorDesktop (opens a browser tab) instead of the back-end — this is how
-//     the GitHub authorization page is opened for the OAuth device flow.
+//     the GitHub authorization page is opened for the OAuth web flow.
 //   * __CTX (injected by the client before this source) carries the theme and
 //     the space id — no secrets, no identity.
 //
 // Conservative JS (var, function expressions, no template literals, no string[i]
 // indexing) to stay comfortably inside js2elpian. No text inputs, no timers: the
-// whole dashboard is button-driven and the device-flow polling is server-paced.
+// whole dashboard is button-driven and the connect wait is server-paced (the
+// back-end long-polls `oauth_wait`, so a "pending" reply just re-invokes).
 
 import 'reactnative.js';
 
@@ -82,12 +83,12 @@ var T = theme();
 // --------------------------------------------------------------------------- //
 
 var S = {
-  view: 'loading',      // loading | connect | device | repos | repo | error
+  view: 'loading',      // loading | connect | waiting | repos | repo | error
   error: null,
   busy: false,          // a foreground action is in flight
   conn: null,           // { connected, login, shared, is_owner, can_use, can_manage }
-  device: null,         // { user_code, verification_uri, verification_uri_complete }
-  deviceEpoch: 0,       // bumped when we leave the device view, to stop stale polls
+  auth: null,           // { authorize_url, state } for the in-flight connect
+  authEpoch: 0,         // bumped when we leave the waiting view, to stop stale polls
   orgs: [],
   user: null,
   activeOrg: null,      // null = all accessible repos
@@ -162,33 +163,32 @@ function beginConnect() {
   S.busy = true; render();
   hostCall('oauth_start', {}, function (err, res) {
     S.busy = false;
-    if (err != null || res == null || res.ok === false) {
+    if (err != null || res == null || res.ok === false || res.authorize_url == null) {
       toast((res && res.error) ? res.error : ('could not start: ' + err), true);
       return;
     }
-    S.device = res;
-    S.view = 'device';
-    S.deviceEpoch = S.deviceEpoch + 1;
+    S.auth = res;
+    S.view = 'waiting';
+    S.authEpoch = S.authEpoch + 1;
     render();
     openAuthPage();
-    pollDevice(S.deviceEpoch);
+    pollConnect(S.authEpoch);
   });
 }
 
 function openAuthPage() {
-  if (S.device == null) return;
-  var url = S.device.verification_uri_complete || S.device.verification_uri;
-  if (url == null) return;
-  hostCall('host:openUrl', { url: url }, function () {});
+  if (S.auth == null || S.auth.authorize_url == null) return;
+  hostCall('host:openUrl', { url: S.auth.authorize_url }, function () {});
 }
 
-// Server-paced polling: the back-end long-polls (wait:true), so on a "pending"
-// reply we simply call again — no guest timer needed. `epoch` guards against a
-// stale loop continuing after the user cancelled or connected.
-function pollDevice(epoch) {
-  if (epoch !== S.deviceEpoch) return;
-  hostCall('oauth_poll', { wait: true }, function (err, res) {
-    if (epoch !== S.deviceEpoch) return;
+// Server-paced wait: the back-end long-polls `oauth_wait` (blocks until the Nest
+// callback stores the token), so on a "pending" reply we simply call again — no
+// guest timer needed. `epoch` guards against a stale loop continuing after the
+// user cancelled or connected.
+function pollConnect(epoch) {
+  if (epoch !== S.authEpoch) return;
+  hostCall('oauth_wait', { wait: true }, function (err, res) {
+    if (epoch !== S.authEpoch) return;
     if (err != null || res == null || res.ok === false) {
       S.error = (res && res.error) ? res.error : ('' + err);
       S.view = 'error';
@@ -196,20 +196,27 @@ function pollDevice(epoch) {
       return;
     }
     if (res.connected === true || res.status === 'connected') {
-      S.deviceEpoch = S.deviceEpoch + 1; // stop any further polls
+      S.authEpoch = S.authEpoch + 1; // stop any further polls
       hostCall('status', {}, function (e2, st) {
         S.conn = (e2 == null && st) ? st : { connected: true, login: res.login, shared: res.shared, is_owner: true, can_use: true, can_manage: true };
         enterDashboard();
       });
       return;
     }
-    pollDevice(epoch); // still pending — go again (the call blocked server-side)
+    if (res.status === 'expired') {
+      S.authEpoch = S.authEpoch + 1;
+      S.auth = null;
+      S.view = 'connect';
+      toast('the authorization timed out — try connecting again', true);
+      return;
+    }
+    pollConnect(epoch); // still pending — go again (the call blocked server-side)
   });
 }
 
 function cancelConnect() {
-  S.deviceEpoch = S.deviceEpoch + 1;
-  S.device = null;
+  S.authEpoch = S.authEpoch + 1;
+  S.auth = null;
   S.view = 'connect';
   render();
 }
@@ -509,28 +516,27 @@ function viewConnect(root) {
   root.add(c);
 }
 
-function viewDevice(root) {
-  root.add(header('Authorize GitHub', 'Enter this code on github.com', { back: cancelConnect }));
+function viewWaiting(root) {
+  root.add(header('Authorize GitHub', 'Approve access in the GitHub tab', { back: cancelConnect }));
   var c = RN.column({ style: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 26, backgroundColor: T.bg } });
-  c.add(RN.text('Your one-time code', { color: T.muted, fontSize: 12 }));
-  var codeBox = RN.view({
+  var hero = RN.view({
     style: {
-      marginTop: 12, paddingHorizontal: 22, paddingVertical: 16, borderRadius: 14,
-      backgroundColor: T.surface, borderWidth: 1, borderColor: T.accent
+      width: 72, height: 72, borderRadius: 20, backgroundColor: T.surface,
+      borderWidth: 1, borderColor: T.line, alignItems: 'center', justifyContent: 'center'
     }
   });
-  codeBox.add(RN.text((S.device && S.device.user_code) ? S.device.user_code : '········',
-    { color: T.accent, fontSize: 30, fontWeight: '800', style: { fontFamily: 'Menlo', letterSpacing: 4 } }));
-  c.add(codeBox);
-  var row = RN.row({ style: { marginTop: 22 } });
-  row.add(btn('Open GitHub', openAuthPage, 'primary'));
-  c.add(row);
-  var waitRow = RN.row({ style: { marginTop: 20, alignItems: 'center' } });
+  hero.add(RN.text('🐙', { fontSize: 38 }));
+  c.add(hero);
+  var waitRow = RN.row({ style: { marginTop: 22, alignItems: 'center' } });
   waitRow.add(RN.spinner({ color: T.accent }));
-  waitRow.add(RN.text('Waiting for you to authorize…', { color: T.muted, fontSize: 12, style: { marginLeft: 10 } }));
+  waitRow.add(RN.text('Waiting for you to approve on GitHub…', { color: T.text, fontSize: 14, fontWeight: '600', style: { marginLeft: 10 } }));
   c.add(waitRow);
-  c.add(RN.text('After you approve access, this returns to your repositories automatically.',
-    { color: T.muted, fontSize: 11, textAlign: 'center', style: { marginTop: 16, maxWidth: 320 } }));
+  c.add(RN.text('A GitHub tab opened for you. Choose the account and organizations to grant, then approve — this returns to your repositories automatically.',
+    { color: T.muted, fontSize: 12, textAlign: 'center', style: { marginTop: 14, maxWidth: 340 } }));
+  var row = RN.row({ style: { marginTop: 22 } });
+  row.add(btn('Reopen GitHub', openAuthPage, 'primary'));
+  row.add(btn('Cancel', cancelConnect, null));
+  c.add(row);
   root.add(c);
 }
 
@@ -805,7 +811,7 @@ function render() {
   if (S.view === 'loading') viewLoading(root);
   else if (S.view === 'error') viewError(root);
   else if (S.view === 'connect') viewConnect(root);
-  else if (S.view === 'device') viewDevice(root);
+  else if (S.view === 'waiting') viewWaiting(root);
   else if (S.view === 'repo') viewRepo(root);
   else viewRepos(root);
 

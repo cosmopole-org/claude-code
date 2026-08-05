@@ -18,24 +18,34 @@ deployment:
 
     github/conn/<space_id>     JSON  {owner_user_id, login, shared, scopes, ...}
     github/token/<space_id>    the user's GitHub OAuth access token (secret)
-    github/pending/<space_id>  in-flight device-flow handshake
+    github/pending/<space_id>  in-flight OAuth handshake (per space, for oauth_wait)
+    github/oauth_state/<state> in-flight OAuth handshake (per state, for the callback)
 
 The **binding between a Decillion space and a GitHub account is the OAuth token**
 one member connected, so the token is what every call is authorised against. A
 per-space *shared* toggle decides whether the rest of the space (people **and**
 agents) may drive the connection, or only the member who connected it.
 
-OAuth uses GitHub's **Device Authorization flow**, which needs no redirect URL,
-no callback server and no Victor hooks: the front-end asks the back-end to start
-the flow, opens ``https://github.com/login/device`` in a browser tab, the user
-enters the shown code and grants the requested account + organization access,
-and the back-end polls GitHub until the token is issued and stores it.
+OAuth uses GitHub's standard **web application flow** (authorization code) — the
+same "press Connect → GitHub opens in a tab → approve → done" flow every other
+GitHub app uses, with **no code to type**:
+
+1. The front-end calls ``oauth_start``; the back-end returns the GitHub
+   ``authorize_url`` (with a one-time ``state``) and opens it in a browser tab.
+2. The member approves the account + organization access on github.com.
+3. GitHub redirects the tab to Nest's fixed callback
+   (``GITHUB_OAUTH_REDIRECT_URI``) with ``?code=…&state=…``. Nest signals this
+   creature ``oauth_exchange``, which swaps the code for a token and stores it.
+4. The front-end long-polls ``oauth_wait`` and flips to the dashboard once the
+   token lands.
 
 The OAuth **app credentials** come from the container environment only — never
 from a signal payload a prompt could influence:
 
-    GITHUB_OAUTH_CLIENT_ID       required to start the device flow
-    GITHUB_OAUTH_CLIENT_SECRET   optional (device-flow public apps omit it)
+    GITHUB_OAUTH_CLIENT_ID       required (the OAuth App / GitHub App client id)
+    GITHUB_OAUTH_CLIENT_SECRET   required (the web flow signs the token exchange)
+    GITHUB_OAUTH_REDIRECT_URI    required — Nest's callback, must exactly match the
+                                 OAuth app's "Authorization callback URL"
     GITHUB_OAUTH_SCOPES          default "repo,read:org,workflow,read:user"
     GITHUB_API_BASE              default https://api.github.com
     GITHUB_WEB_BASE              default https://github.com
@@ -47,7 +57,9 @@ import base64
 import json
 import os
 import re
+import secrets
 import time
+import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -55,6 +67,9 @@ import requests
 API_BASE = os.environ.get("GITHUB_API_BASE", "https://api.github.com").rstrip("/")
 WEB_BASE = os.environ.get("GITHUB_WEB_BASE", "https://github.com").rstrip("/")
 DEFAULT_SCOPES = os.environ.get("GITHUB_OAUTH_SCOPES", "repo,read:org,workflow,read:user")
+# How long an in-flight OAuth handshake (the authorize→callback round-trip) stays
+# valid before the front-end must start over.
+OAUTH_STATE_TTL_S = int(os.environ.get("GITHUB_OAUTH_STATE_TTL_S", "900"))
 
 HTTP_TIMEOUT = float(os.environ.get("GITHUB_HTTP_TIMEOUT", "45"))
 # Command output / API bodies are fed back into an LLM context and a mobile UI —
@@ -350,117 +365,159 @@ def _assert_owner(space_id: str, payload: Dict[str, Any], conn: Dict[str, Any], 
 
 
 # --------------------------------------------------------------------------- #
-# OAuth device flow
+# OAuth web application flow (authorization code)
 # --------------------------------------------------------------------------- #
+#
+# The classic "Connect with GitHub" flow: the front-end opens the authorize URL
+# in a tab, the member approves, and GitHub redirects the tab to Nest's fixed
+# callback with a one-time ``code``. Nest hands the code back to us over a signal
+# (``oauth_exchange``) and we swap it for a token. No code is ever typed, and the
+# client secret stays in this container — the front-end never sees it.
+
+def _client_secret() -> str:
+    val = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "").strip()
+    if not val:
+        raise GithubError(
+            "no GitHub OAuth client secret configured — set GITHUB_OAUTH_CLIENT_SECRET on the "
+            "github creature image (the web flow signs the token exchange with it)")
+    return val
+
+
+def _redirect_uri() -> str:
+    val = os.environ.get("GITHUB_OAUTH_REDIRECT_URI", "").strip()
+    if not val:
+        raise GithubError(
+            "no GitHub OAuth redirect URI configured — set GITHUB_OAUTH_REDIRECT_URI on the github "
+            "creature image to Nest's callback (…/api/github/oauth/callback), and register the exact "
+            "same URL as the OAuth app's Authorization callback URL")
+    return val
+
+
+def _make_state(space_id: str) -> str:
+    """A one-time, unguessable state that also carries the space id.
+
+    The Nest callback receives only ``code`` + ``state`` from GitHub's redirect,
+    so the space id must travel inside the state. It is base64url-encoded (opaque
+    to GitHub) and paired with a random nonce we verify against stored state, so a
+    forged state cannot connect a token to a space."""
+    prefix = base64.urlsafe_b64encode(space_id.encode("utf-8")).decode("ascii").rstrip("=")
+    return prefix + "." + secrets.token_urlsafe(24)
+
 
 def _oauth_start(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Begin the device flow and hand the front-end the code + verification URL."""
+    """Begin the web flow: return the GitHub authorize URL for the front-end to
+    open in a browser tab. Records a one-time handshake keyed by both the state
+    (for the callback) and the space (for oauth_wait)."""
     client_id = _client_id()
+    redirect_uri = _redirect_uri()
+    _client_secret()  # fail fast now if the exchange could never succeed later
     scopes = str(payload.get("scopes") or DEFAULT_SCOPES)
-    status, parsed = _form_post(f"{WEB_BASE}/login/device/code",
-                                {"client_id": client_id, "scope": scopes.replace(",", " ")})
-    if status >= 300 or not isinstance(parsed, dict) or not parsed.get("device_code"):
-        raise GithubError(f"could not start GitHub device authorization ({status}): {parsed}",
-                          status=status or 502)
-    pending = {
-        "device_code": parsed["device_code"],
-        "interval": int(parsed.get("interval") or 5),
-        "expires_at": time.time() + int(parsed.get("expires_in") or 900),
-        "started_by": _caller(payload),
-        "scopes": scopes,
+    state = _make_state(space_id)
+    expires_at = time.time() + OAUTH_STATE_TTL_S
+    handshake = {
+        "state": state, "space_id": space_id,
+        "started_by": _caller(payload), "scopes": scopes,
+        "expires_at": expires_at,
     }
-    _json_put(f"github/pending/{space_id}", pending)
+    _json_put(f"github/oauth_state/{state}", handshake)
+    _json_put(f"github/pending/{space_id}", {"state": state, "expires_at": expires_at})
+    query = urllib.parse.urlencode({
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "scope": scopes.replace(",", " "),
+        "state": state,
+        "allow_signup": "false",
+    })
     return {
         "ok": True, "action": "oauth_start", "space_id": space_id,
-        "user_code": parsed.get("user_code"),
-        "verification_uri": parsed.get("verification_uri") or f"{WEB_BASE}/login/device",
-        "verification_uri_complete": parsed.get("verification_uri_complete"),
-        "interval": pending["interval"],
-        "expires_in": int(parsed.get("expires_in") or 900),
+        "authorize_url": f"{WEB_BASE}/login/oauth/authorize?{query}",
+        "state": state,
+        "expires_in": OAUTH_STATE_TTL_S,
     }
 
 
-def _oauth_poll(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Poll GitHub for the device-flow result; store the token on success.
+def _oauth_exchange(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Swap the authorization ``code`` for a token and store the connection.
 
-    The Elpian front-end has no timer to pace polling, so when it passes
-    ``wait: true`` we **long-poll** server-side: poll once, and while GitHub says
-    "authorization_pending" sleep the interval and poll again, up to a wall
-    budget kept comfortably under the host-call timeout. The front-end simply
-    re-invokes whenever we return ``status == "pending"``, so the loop is paced
-    with no guest-side clock."""
-    if not payload.get("wait"):
-        return _oauth_poll_once(space_id, payload)
-    budget = time.time() + float(payload.get("wait_seconds") or 25)
-    interval = 5.0
-    while True:
-        res = _oauth_poll_once(space_id, payload)
-        if res.get("status") != "pending":
-            return res
-        if res.get("slow_down"):
-            interval += 5.0
-        if time.time() + interval >= budget:
-            return res
-        time.sleep(interval)
+    Called by Nest's OAuth callback route (signed as the operator) with the
+    ``code`` + ``state`` GitHub redirected back. The space and the owner come from
+    the stored handshake, never from the caller, so this cannot be steered."""
+    code = str(payload.get("code") or "").strip()
+    state = str(payload.get("state") or "").strip()
+    if not code or not state:
+        raise GithubError("the GitHub callback was missing its code or state", status=400)
 
+    handshake = _json_get(f"github/oauth_state/{state}")
+    if not handshake:
+        raise GithubError("this GitHub authorization is unknown or already used — start over",
+                          status=409)
+    if time.time() > float(handshake.get("expires_at") or 0):
+        _store_del(f"github/oauth_state/{state}")
+        raise GithubError("this GitHub authorization expired — start over", status=410)
 
-def _oauth_poll_once(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """One device-flow poll against GitHub; store the token on success."""
-    pending = _json_get(f"github/pending/{space_id}")
-    if not pending or not pending.get("device_code"):
-        raise GithubError("no GitHub authorization is in progress — start over", status=409)
-    if time.time() > float(pending.get("expires_at") or 0):
-        _store_del(f"github/pending/{space_id}")
-        raise GithubError("the authorization code expired — start over", status=410)
+    target_space = str(handshake.get("space_id") or "")
+    if not target_space:
+        raise GithubError("the stored GitHub authorization has no space", status=409)
 
     fields = {
         "client_id": _client_id(),
-        "device_code": pending["device_code"],
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "client_secret": _client_secret(),
+        "code": code,
+        "redirect_uri": _redirect_uri(),
+        "state": state,
     }
-    secret = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "").strip()
-    if secret:
-        fields["client_secret"] = secret
     status, parsed = _form_post(f"{WEB_BASE}/login/oauth/access_token", fields)
     if not isinstance(parsed, dict):
         raise GithubError(f"unexpected token response from GitHub ({status})", status=status or 502)
-
     if parsed.get("error"):
-        err = str(parsed.get("error"))
-        if err in ("authorization_pending", "slow_down"):
-            return {"ok": True, "action": "oauth_poll", "space_id": space_id,
-                    "status": "pending", "connected": False, "slow_down": err == "slow_down"}
-        if err in ("expired_token", "access_denied"):
-            _store_del(f"github/pending/{space_id}")
-        raise GithubError(f"GitHub authorization failed: {parsed.get('error_description') or err}",
+        raise GithubError(f"GitHub authorization failed: {parsed.get('error_description') or parsed.get('error')}",
                           status=400)
-
     token = parsed.get("access_token")
     if not token:
-        return {"ok": True, "action": "oauth_poll", "space_id": space_id,
-                "status": "pending", "connected": False}
+        raise GithubError("GitHub returned no access token", status=502)
 
-    # Success: resolve who authorized, persist the token + connection, drop the
-    # handshake. The member who *started* the flow owns the connection.
     login, name = "", ""
     try:
-        me = _api("GET", "/user", token)
+        me = _api("GET", "/user", str(token))
         login, name = str(me.get("login") or ""), str(me.get("name") or "")
     except GithubError:
         pass
     conn = {
-        "owner_user_id": pending.get("started_by") or _caller(payload),
+        "owner_user_id": handshake.get("started_by") or "",
         "login": login, "name": name,
-        "shared": bool((_conn(space_id) or {}).get("shared", False)),
-        "scopes": str(parsed.get("scope") or pending.get("scopes") or DEFAULT_SCOPES),
+        "shared": bool((_conn(target_space) or {}).get("shared", False)),
+        "scopes": str(parsed.get("scope") or handshake.get("scopes") or DEFAULT_SCOPES),
         "connected_at": int(time.time()),
     }
-    _store_put(f"github/token/{space_id}", str(token))
-    _json_put(f"github/conn/{space_id}", conn)
-    _store_del(f"github/pending/{space_id}")
-    return {"ok": True, "action": "oauth_poll", "space_id": space_id, "status": "connected",
-            "connected": True, "login": login, "name": name, "shared": conn["shared"],
-            "scopes": conn["scopes"]}
+    _store_put(f"github/token/{target_space}", str(token))
+    _json_put(f"github/conn/{target_space}", conn)
+    _store_del(f"github/oauth_state/{state}")
+    _store_del(f"github/pending/{target_space}")
+    return {"ok": True, "action": "oauth_exchange", "space_id": target_space,
+            "status": "connected", "connected": True, "login": login, "name": name,
+            "shared": conn["shared"], "scopes": conn["scopes"]}
+
+
+def _oauth_wait(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Server-paced wait for the callback to land, so the front-end needs no
+    timer: block until the token is stored (the exchange ran), the handshake
+    expires, or a wall budget under the host-call timeout elapses. The front-end
+    simply re-invokes on ``status == "pending"``."""
+    budget = time.time() + float(payload.get("wait_seconds") or 25)
+    interval = 2.0
+    while True:
+        if _store_get(f"github/token/{space_id}"):
+            res = _status(space_id, payload)
+            res.update({"ok": True, "action": "oauth_wait", "status": "connected", "connected": True})
+            return res
+        pending = _json_get(f"github/pending/{space_id}")
+        if not pending or time.time() > float(pending.get("expires_at") or 0):
+            return {"ok": True, "action": "oauth_wait", "space_id": space_id,
+                    "status": "expired", "connected": False}
+        if time.time() + interval >= budget:
+            return {"ok": True, "action": "oauth_wait", "space_id": space_id,
+                    "status": "pending", "connected": False}
+        time.sleep(interval)
 
 
 def _status(space_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1276,9 +1333,10 @@ def _clip(text: Optional[str], limit: int = MAX_OUTPUT_CHARS) -> str:
 # --------------------------------------------------------------------------- #
 
 _ACTIONS = {
-    # connection / oauth
+    # connection / oauth (web application flow)
     "oauth_start": _oauth_start, "connect": _oauth_start,
-    "oauth_poll": _oauth_poll, "poll": _oauth_poll,
+    "oauth_exchange": _oauth_exchange, "exchange": _oauth_exchange,
+    "oauth_wait": _oauth_wait, "wait": _oauth_wait,
     "status": _status, "connection": _status,
     "disconnect": _disconnect, "logout": _disconnect,
     "set_shared": _set_shared, "settings": _set_shared,

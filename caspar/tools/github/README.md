@@ -39,21 +39,28 @@ fails (e.g. the sandbox was re-minted). The NestJS proxy pins only the `space_id
 on a call — it is never in the creature↔creature routing path, so the tool can
 only ever drive *its own* space's machine (the one that store's members list).
 
-## Connecting (OAuth device flow)
+## Connecting (OAuth web application flow)
 
-The connect button uses GitHub's **Device Authorization flow**, which needs no
-redirect URL, no callback server and no Victor hooks:
+The connect button uses GitHub's standard **web application flow** — the same
+"press Connect → GitHub opens in a tab → approve → done" flow every other GitHub
+app uses, with **no code to type**:
 
-1. `oauth_start` → the creature asks GitHub for a device code and returns a
-   `user_code` + `verification_uri`.
-2. The front-end opens `https://github.com/login/device` in a browser tab (via
-   the host's `host:openUrl` capability) and shows the code.
-3. The user enters the code and grants the requested **account + organization**
-   access.
-4. The front-end polls `oauth_poll`; the creature exchanges the device code for a
-   token, stores it, and the UI flips to the dashboard.
+1. `oauth_start` → the creature returns the GitHub `authorize_url` (carrying a
+   one-time `state` that also encodes the space id) and records the handshake.
+2. The front-end opens that URL in a browser tab (via the host's `host:openUrl`
+   capability).
+3. The user picks the **account + organizations** to grant and approves.
+4. GitHub redirects the tab to Nest's fixed callback
+   (`GITHUB_OAUTH_REDIRECT_URI`, `…/api/github/oauth/callback`) with `?code&state`.
+   Nest signals the creature `oauth_exchange`, which swaps the code for a token and
+   stores it. The tab shows "connected" and closes.
+5. The front-end long-polls `oauth_wait` and flips to the dashboard once the token
+   lands — server-paced, so it needs no client-side timer.
 
-The member who started the flow **owns** the connection.
+The client secret never leaves the creature (the exchange runs there), and the
+space + owner come from the creature's stored handshake, not the callback request,
+so a forged callback cannot bind a token to a space it did not start. The member
+who started the flow **owns** the connection.
 
 ## Sharing
 
@@ -72,7 +79,8 @@ the connection is gated. Only the owner can flip sharing or disconnect.
 | function | what it does |
 |---|---|
 | `status` | connection state, account, sharing, and whether the caller may use/manage it |
-| `oauth_start` / `oauth_poll` | device-flow connect (front-end) |
+| `oauth_start` / `oauth_wait` | web-flow connect (front-end): get the authorize URL, then wait for the callback |
+| `oauth_exchange` | swap the callback's `code` for a token (called by Nest's callback route) |
 | `set_shared` / `disconnect` | owner-only settings |
 | `orgs` | the connected user + the orgs they granted |
 | `repos` | repositories (optionally scoped to an `org`) |
@@ -116,9 +124,11 @@ signal payload, so a prompt-injected agent cannot swap the OAuth app.
 
 | env | meaning |
 |---|---|
-| `GITHUB_OAUTH_CLIENT_ID` | the GitHub OAuth App / GitHub App client id (device flow **must** be enabled on it) |
-| `GITHUB_OAUTH_CLIENT_SECRET` | optional — device-flow public apps omit it |
+| `GITHUB_OAUTH_CLIENT_ID` | the GitHub OAuth App / GitHub App client id |
+| `GITHUB_OAUTH_CLIENT_SECRET` | **required** — the web flow signs the token exchange with it |
+| `GITHUB_OAUTH_REDIRECT_URI` | **required** — Nest's callback (`…/api/github/oauth/callback`); must **exactly** match the OAuth app's "Authorization callback URL" |
 | `GITHUB_OAUTH_SCOPES` | default `repo,read:org,workflow,read:user` |
+| `GITHUB_OAUTH_STATE_TTL_S` | how long a pending connect stays valid (default `900`) |
 
 > **CI note:** GitHub Actions forbids secret/variable names starting with the
 > reserved `GITHUB_` prefix. Provide the app under the `GH_OAUTH_CLIENT_ID`,

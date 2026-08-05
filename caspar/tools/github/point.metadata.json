@@ -187,12 +187,12 @@
     },
     {
       "name": "oauth_start",
-      "desc": "begin the GitHub device-authorization flow (front-end only); returns a user_code and verification URL",
+      "desc": "begin the GitHub OAuth web flow (front-end only); returns the authorize URL to open in a browser tab",
       "args": {}
     },
     {
-      "name": "oauth_poll",
-      "desc": "poll the device-authorization flow until the token is issued (front-end only)",
+      "name": "oauth_wait",
+      "desc": "long-poll until the OAuth callback stores the token (front-end only); returns connected/pending/expired",
       "args": {}
     },
     {
