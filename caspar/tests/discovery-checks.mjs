@@ -48,9 +48,15 @@ async function check(name, fn) {
 const SANDBOX_META = { public: { decillion: { kind: "tool", name: "sandbox", usecases: ["run code", "edit files"], howToTalk: "call exec/write/read", argSchema: { command: { type: "string" } }, function: "exec" } } };
 const RESEARCHER_META = { decillion: { kind: "agent", name: "Researcher", usecases: ["deep research"], howToTalk: "ask in prose" } };
 
-/** A node-shaped onCall: readMembers → members; getCreature → its metadata. */
-function nodeBehaviour({ members, metaById }) {
+/** A node-shaped onCall: readMembers → members; getCreature → its metadata;
+ * getJson(StoreProgramIndex) → the space's attached programs (tools + agents). */
+function nodeBehaviour({ members, metaById, programIndex }) {
   return (op, input) => {
+    if (op === "getJson") {
+      const key = String(input?.key || "");
+      if (programIndex && key === "Json::StoreProgramIndex::space-1") return { ok: true, data: programIndex };
+      return { ok: true };
+    }
     if (op === "readMembers" || op === "listStoreMembers" || op === "listStoreAccess" || op === "listAccess") {
       // Only answer for the right store; otherwise behave like "unknown store".
       if (input?.storeId !== "space-1" && input?.id !== "space-1") return { ok: true, members: [] };
@@ -204,6 +210,34 @@ async function main() {
       // it actually listed members and read each creature over the gateway
       assert.ok(gw.calls.some((c) => /Members|Access/i.test(c.op)), "a member-listing host call was made");
       assert.equal(gw.calls.filter((c) => c.op === "getCreature").length, 3, "each member's creature record was read");
+    });
+  });
+
+  await check("discoverSpaceCatalog reads the program index (where tools/agents are attached)", async () => {
+    // Platform tools + sub-agents are attached as PROGRAMS, not store members.
+    const programIndex = {
+      "px-sandbox": {
+        programId: "px-sandbox", creatureId: "cx-sandbox", entityId: "vercel_sandbox",
+        metadata: { name: "vercel_sandbox", descriptor: SANDBOX_META.public.decillion, defaults: { space_id: "space-1" } },
+      },
+      "px-researcher": {
+        programId: "px-researcher", creatureId: "cx-researcher", entityId: "agent",
+        metadata: { descriptor: RESEARCHER_META.decillion },
+      },
+      // A record with no descriptor but a name still surfaces (older spaces).
+      "px-legacy": { programId: "px-legacy", creatureId: "cx-legacy", metadata: { name: "legacy-tool" } },
+    };
+    await withBridge(nodeBehaviour({ members: [], metaById: {}, programIndex }), async (bridge, gw) => {
+      const entries = await discoverSpaceCatalog(bridge, { spaceId: "space-1" }, { timeoutMs: 3000 });
+      const names = entries.map((e) => e.name).sort();
+      // The descriptor's own name ("sandbox") wins over the record's name.
+      assert.deepEqual(names, ["Researcher", "legacy-tool", "sandbox"]);
+      const sb = entries.find((e) => e.program_id === "px-sandbox");
+      assert.equal(sb.entity_id, "vercel_sandbox");
+      assert.deepEqual(sb.defaults, { space_id: "space-1" }, "the platform-pinned space binding is carried");
+      // The index carries descriptors inline — no per-member getCreature needed.
+      assert.equal(gw.calls.filter((c) => c.op === "getCreature").length, 0, "no getCreature round-trips");
+      assert.ok(gw.calls.some((c) => c.op === "getJson"), "read the program index over the gateway");
     });
   });
 

@@ -70,7 +70,7 @@ which the node relays while keeping the correlation open.
 | `taskSignal.mjs` | Peels the StoresSend / `payload` / proxy envelopes into a task; derives the conversation thread key. |
 | `prompt.mjs` | Composes what Claude Code is given: the agent's skill as persona, the group-chat preamble and roster, the thread's history with `[From → To]` annotations. |
 | `catalog.mjs` | Turns the space's `config.tools` into MCP tool definitions; applies the platform's pinned `defaults` after the model's arguments; `mergeCatalogs` unions the backend catalog with live discovery. |
-| `discovery.mjs` | Fetches the space's employable creatures (tools, apps, sub-agents) straight from the node at prompt time (`readMembers` + `getCreature`) and builds catalog entries, so the agent sees the space's live roster even when `config.tools` is thin. |
+| `discovery.mjs` | Fetches the space's employable creatures (tools, apps, sub-agents) straight from the node at prompt time — the **program index** (`getJson` on `Json::StoreProgramIndex::<space>`, where tools/agents are attached), supplemented by `readMembers` + `getCreature` — and builds catalog entries, so the agent sees the space's live roster even when `config.tools` is thin. |
 | `toolInvoker.mjs` | Employs a tool creature over the gateway and awaits its correlated `tools/result`. |
 | `toolSocket.mjs` / `mcpStdioServer.mjs` | The `caspar` MCP server Claude Code talks to, and its unix-socket link back to this process (which owns the single gateway connection). |
 | `claudeRunner.mjs` | Runs the CLI headless: flags, per-agent LLM override, privilege drop, wall-clock kill. |
@@ -131,14 +131,17 @@ Two sources feed that catalog, unioned by `mergeCatalogs`:
    descriptors). It is **authoritative**: it carries the platform-pinned `defaults`
    (e.g. the bound `space_id`) that keep a shared tool working on *this* space.
 2. **Live discovery** (`discovery.mjs`) — the creature also fetches the space's
-   members itself, over the gateway, using the node's own host functions
-   (`readMembers` on the space store → `getCreature` per member for its
-   descriptor). This mirrors `DiscoveryService` exactly but from inside the
-   container, so the agent sees the space's live roster even when the backend sends
-   a thin `config.tools`. It is **best-effort**: an unresolved space id, a host op
-   the node does not expose, or an unexpected shape all yield nothing rather than an
-   error, and a discovered entry only *adds* a creature the backend did not send —
-   it never displaces a backend entry or its pinned binding.
+   roster itself, over the gateway, using the node's own host functions. It reads
+   the **program index** (`getJson` on `Json::StoreProgramIndex::<space>`) first —
+   where a space's tools and sub-agents are actually attached (a platform tool like
+   the sandbox is a *program*, never a store member, so a members-only scan missed
+   them entirely) — then supplements with `readMembers` + `getCreature`. This
+   mirrors `DiscoveryService` but from inside the container, so the agent sees the
+   space's live roster even when the backend sends a thin `config.tools`. It is
+   **best-effort**: an unresolved space id, a host op the node does not expose, or
+   an unexpected shape all yield nothing rather than an error, and a discovered
+   entry only *adds* a creature the backend did not send — it never displaces a
+   backend entry or its pinned binding.
 
 Knobs (env): `CLAUDE_CREATURE_DISCOVER_TOOLS` (default on), `_DISCOVER_TIMEOUT_MS`
 (default 8000), `_DISCOVER_MAX` (default 50 members). `node caspar/tests/discovery-checks.mjs`
