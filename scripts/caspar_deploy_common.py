@@ -136,10 +136,29 @@ def resolve_operator(client) -> str:
     """
     op_id = env_any("CASPAR_OPERATOR_ID", "CASPAR_OPERATOR_USER_ID")
     op_key = os.environ.get("CASPAR_OPERATOR_PRIVATE_KEY", "")
-    if op_id and op_key:
+    # A base64-encoded key (CASPAR_OPERATOR_PRIVATE_KEY_B64) is the robust way to
+    # inject the PEM through CI: it is a single line with no newlines or quotes to
+    # mangle, so it survives the SSH/env forwarding that can silently truncate or
+    # empty a multi-line secret. Prefer it when the raw key is absent/empty.
+    op_key_b64 = os.environ.get("CASPAR_OPERATOR_PRIVATE_KEY_B64", "").strip()
+    if op_key_b64 and not op_key.strip():
+        try:
+            op_key = base64.b64decode(op_key_b64).decode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            warn(f"CASPAR_OPERATOR_PRIVATE_KEY_B64 is set but could not be base64-decoded: {exc}")
+    if op_id and op_key.strip():
         client.authenticate(op_id, op_key)
-        ok(f"deploy operator from env: {op_id}")
+        ok(f"deploy operator from env: {op_id} (pinned; redeploys reuse this account and never re-mint)")
         return op_id
+    if op_id and not op_key.strip():
+        # A half-configured pin is the classic cause of "still re-minting despite
+        # pinning": the id is set, the key never arrived, so we fall back to the
+        # file/login path and drift. Make it LOUD instead of silent.
+        warn(f"CASPAR_OPERATOR_ID={op_id} is set but no usable private key was provided "
+             "(CASPAR_OPERATOR_PRIVATE_KEY empty/unusable and no CASPAR_OPERATOR_PRIVATE_KEY_B64). "
+             "The pinned operator is NOT in effect — falling back to the persisted file / login, "
+             "which is what causes tool programs to re-mint. Set CASPAR_OPERATOR_PRIVATE_KEY_B64 to a "
+             "base64-encoded PEM (immune to newline mangling in CI) to fix this.")
 
     path = _operator_identity_path()
     saved = _read_identity(path)
