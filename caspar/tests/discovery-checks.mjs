@@ -241,6 +241,29 @@ async function main() {
     });
   });
 
+  await check("discoverSpaceCatalog excludes the calling agent's own proxy (no self-invocation)", async () => {
+    // The caller's own proxy shows up in the program index like any other program;
+    // handing it back would make the model call itself and hang. It must be dropped
+    // whether identified by proxy program id, resource id, or creature id.
+    const programIndex = {
+      "px-self": {
+        programId: "px-self", creatureId: "cx-self", entityId: "agent", resourceId: "res-me",
+        metadata: { descriptor: { kind: "agent", name: "Gpt_5_4_Mini", usecases: ["chat"] } },
+      },
+      "px-sandbox": {
+        programId: "px-sandbox", creatureId: "cx-sandbox", entityId: "vercel_sandbox",
+        metadata: { name: "vercel_sandbox", descriptor: SANDBOX_META.public.decillion },
+      },
+    };
+    await withBridge(nodeBehaviour({ members: [], metaById: {}, programIndex }), async (bridge) => {
+      // Identify self by the proxy program the signal was sent to and the resource id.
+      const task = { spaceId: "space-1", proxyProgramId: "px-self", self: { id: "res-me" } };
+      const entries = await discoverSpaceCatalog(bridge, task, { timeoutMs: 3000 });
+      const names = entries.map((e) => e.name).sort();
+      assert.deepEqual(names, ["sandbox"], "only the sandbox — the agent's own proxy is excluded");
+    });
+  });
+
   await check("discoverSpaceCatalog is empty (never throws) with no space / no members", async () => {
     await withBridge(nodeBehaviour({ members: [], metaById: {} }), async (bridge) => {
       assert.deepEqual(await discoverSpaceCatalog(bridge, { sessionId: "space:other:x" }, { timeoutMs: 2000 }), []);
