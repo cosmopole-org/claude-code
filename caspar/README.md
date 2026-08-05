@@ -240,7 +240,9 @@ Key knobs (all documented in the script's header):
 |---|---|
 | `CLAUDE_REUSE_PROGRAM_ID` | Redeploy onto an existing program id — **use this**, so already-deployed agent proxies keep pointing at a valid backbone |
 | `CLAUDE_ENTITY_ID` | Entity id, default `davinci` (existing proxies target that entity) |
-| `CASPAR_DEPLOY_USER` | Deploy operator, default `davinci_admin` — must own the program being reused |
+| `CASPAR_DEPLOY_IDENTITY_FILE` | Where the durable deploy-operator identity is persisted (default: next to `CASPAR_MANIFEST`). The backbone **and** every tool authenticate as this one account (`caspar_deploy_common.resolve_operator`), so a redeploy always owns the program being reused and never mints a new one. |
+| `CASPAR_OPERATOR_ID` + `CASPAR_OPERATOR_PRIVATE_KEY` | Inject the operator identity explicitly (highest precedence) — lets the Nest deployer and these scripts share one account verbatim |
+| `CASPAR_DEPLOY_USER` | Username used for the **first** login only, when no identity is persisted yet (default `davinci_admin`); after that the persisted identity is reused |
 | `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_BASE_URL` | The backbone, baked into the image |
 | `CLAUDE_CODE_CLI_SOURCE` | `source` (default, compile `src/`), `prebuilt` (copy a CI-built `dist/cli.mjs`, no compile), or `npm` |
 | `CLAUDE_VM_RAM_MB` / `_DISK_GB` / `_CPUS` / `_MAX_SECONDS` | VM resources (defaults 2048 MB / 8 GB / 2 cpu / unlimited) |

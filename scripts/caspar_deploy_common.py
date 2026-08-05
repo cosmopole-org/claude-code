@@ -1,25 +1,30 @@
 """Shared helpers for deploying creatures onto a Caspar node.
 
-Used by both deploy entrypoints in this repo:
+Used by every deploy entrypoint in this repo:
 
 * ``deploy_claude_creature.py`` — the agent backbone (this repo's Claude Code
   source, compiled into a docker creature);
-* ``deploy_sandbox_tool.py``    — the per-space sandbox tool creature.
+* ``deploy_sandbox_tool.py``    — the per-space sandbox tool creature;
+* ``deploy_github_tool.py``     — the github tool creature.
 
-What lives here is everything that is the same for any docker creature: build
-contexts and their digests, the CA bundle and credential baking, the "has the node
-finished building this image?" wait, and the VM resource knobs.
+What lives here is everything that is the same for any docker creature: the durable
+deploy-operator identity (``resolve_operator`` — one account for the backbone and
+every tool, so redeploys reuse the same creatures/programs), build contexts and
+their digests, the CA bundle and credential baking, the "has the node finished
+building this image?" wait, and the VM resource knobs.
 """
 
 from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
+import stat
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 GREEN, RED, YELLOW, CYAN, NC = "\033[0;32m", "\033[0;31m", "\033[0;33m", "\033[0;36m", "\033[0m"
 
@@ -60,6 +65,95 @@ NODE_PORT = int(env_any("CASPAR_NODE_PORT", default="8074"))
 # is why the historical account name is the default and not a new one.
 DEPLOY_USER = env_any("CASPAR_DEPLOY_USER", "CLAUDE_ADMIN_USER", "DAVINCI_ADMIN_USER", default="davinci_admin")
 CA_BUNDLE_PATH = env_any("CASPAR_CA_BUNDLE", default="/etc/ssl/certs/ca-certificates.crt")
+
+
+# --------------------------------------------------------------------------- #
+# The durable deploy operator — one account for the backbone and every tool
+# --------------------------------------------------------------------------- #
+#
+# A creature/program can only be redeployed by the account that owns it, so every
+# deploy in this repo (the Claude Code agent backbone AND the sandbox + github tool
+# creatures) MUST run as the *same* account across runs — otherwise a redeploy is
+# refused ("access to vm denied") and the script is forced to mint a brand-new
+# creature/program, which is exactly the "new programs every deploy" churn we are
+# eliminating. The node's dev login is idempotent by email, but that alone is
+# fragile: it depends on the node's on-chain account state surviving, and it
+# silently forks a new account if the email/username ever differs. So instead of
+# trusting a fresh login each run, we persist the operator identity (its user id +
+# private key) once and reuse it verbatim forever after — the previous operator
+# that deployed the old programs is always found again, byte for byte.
+
+
+def _operator_identity_path() -> Path:
+    """Where the persisted deploy-operator identity lives.
+
+    Defaults next to the Decillion manifest (``CASPAR_MANIFEST``) so it rides the
+    same durable, git-ignored location the recorded program ids do, and survives
+    the ``git reset --hard`` every CI run does on the checkout."""
+    explicit = env_any("CASPAR_DEPLOY_IDENTITY_FILE")
+    if explicit:
+        return Path(explicit)
+    manifest = env_any("CASPAR_MANIFEST")
+    base = Path(manifest).resolve().parent if manifest else Path.cwd()
+    return base / ".caspar-deploy-operator.json"
+
+
+def _read_identity(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict) and data.get("user_id") and data.get("private_key"):
+        return data
+    return None
+
+
+def _write_identity(path: Path, identity: Dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(identity), encoding="utf-8")
+        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)  # 0600 — it carries a private key
+        os.replace(tmp, path)
+    except OSError as exc:  # non-fatal: the deploy still works, just not sticky
+        warn(f"could not persist the deploy operator identity to {path}: {exc}")
+
+
+def resolve_operator(client) -> str:
+    """Authenticate ``client`` as the ONE durable deploy operator; return its id.
+
+    Every deploy — the backbone and every tool — runs as this same account, so a
+    redeploy always owns the creatures/programs it minted and never re-mints them.
+    Resolution order (first hit wins):
+
+      1. An identity injected by CI as ``CASPAR_OPERATOR_ID`` +
+         ``CASPAR_OPERATOR_PRIVATE_KEY`` — lets the Nest deployer and these scripts
+         share a single account explicitly.
+      2. The persisted identity file (written here on the first login) — the normal
+         steady state: the same account, byte for byte, on every subsequent run.
+      3. A fresh ``login(DEPLOY_USER)``, whose resulting identity is then persisted
+         so runs 2+ take path (2).
+    """
+    op_id = env_any("CASPAR_OPERATOR_ID", "CASPAR_OPERATOR_USER_ID")
+    op_key = os.environ.get("CASPAR_OPERATOR_PRIVATE_KEY", "")
+    if op_id and op_key:
+        client.authenticate(op_id, op_key)
+        ok(f"deploy operator from env: {op_id}")
+        return op_id
+
+    path = _operator_identity_path()
+    saved = _read_identity(path)
+    if saved:
+        client.authenticate(saved["user_id"], saved["private_key"])
+        ok(f"deploy operator restored from {path.name}: {saved['user_id']} "
+           f"(username {saved.get('username') or DEPLOY_USER})")
+        return saved["user_id"]
+
+    client.login(DEPLOY_USER)
+    ok(f"deploy operator logged in as {DEPLOY_USER} (user_id={client.user_id})")
+    _write_identity(path, {"user_id": client.user_id, "private_key": client.priv_pem, "username": DEPLOY_USER})
+    info(f"persisted the deploy operator identity to {path} — future redeploys reuse this exact account")
+    return client.user_id
 
 # The node has no true "unlimited" exec cap (`runEntity` clamps <= 0 to 60 and
 # always spawns a reaper), so "unlimited" is a very large but i64-safe value.

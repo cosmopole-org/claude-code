@@ -27,7 +27,11 @@ Connection (plaintext TCP, matching the local `casparctl` node):
     CASPAR_NODE_PORT        node TCP port                 (default 8074)
     CASPAR_CA_BUNDLE        host CA bundle baked into the image for egress TLS
                             (default /etc/ssl/certs/ca-certificates.crt)
-    CASPAR_DEPLOY_USER      deploy operator account       (default davinci_admin)
+    CASPAR_DEPLOY_IDENTITY_FILE  persisted deploy-operator identity, shared with
+                            every tool deploy so a redeploy reuses the same account
+                            and program (default: next to CASPAR_MANIFEST)
+    CASPAR_OPERATOR_ID / CASPAR_OPERATOR_PRIVATE_KEY  inject the operator explicitly
+    CASPAR_DEPLOY_USER      first-login username only      (default davinci_admin)
 
 Program / entity:
     CLAUDE_REUSE_PROGRAM_ID  redeploy onto this existing program (no new creature)
@@ -74,7 +78,6 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
 from caspar_deploy_common import (  # noqa: E402
-    DEPLOY_USER,
     NODE_HOST,
     NODE_PORT,
     VM_MAX_UNLIMITED,
@@ -87,6 +90,7 @@ from caspar_deploy_common import (  # noqa: E402
     env_any,
     info,
     ok,
+    resolve_operator,
     stamp_context,
     truthy,
     vm_label,
@@ -320,8 +324,10 @@ def deploy(client: CasparSignalingClient, *, program_id: str, entity_id: str) ->
 def main() -> int:
     info(f"connecting to Caspar node {NODE_HOST}:{NODE_PORT}")
     client = CasparSignalingClient(NODE_HOST, NODE_PORT, timeout=180).connect()
-    client.login(DEPLOY_USER)
-    ok(f"logged in as {DEPLOY_USER} (user_id={client.user_id})")
+    # Authenticate as the ONE durable deploy operator (the same account the tool
+    # deploys use), so this redeploy owns the agent program it minted before and
+    # keeps every deployed agent proxy pointing at the same backbone.
+    resolve_operator(client)
 
     # Stop mode: bring a running entity down gracefully, then exit. The Decillion
     # CI uses this before restarting the node, so the VM is not yanked with it.
