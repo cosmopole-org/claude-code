@@ -862,6 +862,43 @@ def _read_members(space_id: str) -> List[Dict[str, str]]:
     return []
 
 
+def _read_programs(space_id: str) -> List[Dict[str, Any]]:
+    """The space's attached programs, from the on-chain program index.
+
+    Platform tools (the sandbox) are attached to a space as **programs** — an
+    entry in `Json::StoreProgramIndex::<space>`, written by the spaces creature —
+    not as store *members*. The index carries each program's descriptor + routing
+    inline, so this is both the correct place to find the sandbox and cheaper than
+    a per-member `getCreature` round-trip."""
+    try:
+        resp = _bridge().call("getJson", {"key": "Json::StoreProgramIndex::" + space_id, "path": ""}, timeout=15)
+    except Exception:  # noqa: BLE001
+        return []
+    data: Any = None
+    if isinstance(resp, dict):
+        data = resp.get("data")
+        if not isinstance(data, dict):
+            for k in ("obj", "result"):
+                v = resp.get(k)
+                if isinstance(v, dict) and isinstance(v.get("data"), dict):
+                    data = v.get("data")
+                    break
+    if not isinstance(data, dict):
+        return []
+    return [v for v in data.values() if isinstance(v, dict) and v]
+
+
+def _program_is_sandbox(rec: Dict[str, Any]) -> bool:
+    meta = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+    d = meta.get("descriptor") if isinstance(meta.get("descriptor"), dict) else None
+    if d and _is_sandbox_descriptor(d):
+        return True
+    name = str(meta.get("name") or rec.get("name") or "").lower()
+    if "github" in name:
+        return False
+    return "sandbox" in name or "vercel_sandbox" in name
+
+
 def _discover_sandbox(space_id: str) -> Optional[Dict[str, str]]:
     """Resolve the space's sandbox creature routing, cached briefly."""
     now = time.monotonic()
@@ -869,6 +906,22 @@ def _discover_sandbox(space_id: str) -> Optional[Dict[str, str]]:
     if cached and cached[1] > now:
         return cached[0]
     self_pid = getattr(_BRIDGE, "program_id", "") or ""
+    # 1) Preferred: the space's program index, where the sandbox is attached.
+    for rec in _read_programs(space_id):
+        pid = _pick(rec, ["programId", "program_id"])
+        if pid and pid == self_pid:
+            continue
+        if not _program_is_sandbox(rec):
+            continue
+        meta = rec.get("metadata") if isinstance(rec.get("metadata"), dict) else {}
+        route = {
+            "program_id": pid or _pick(rec, ["creatureId", "creature_id"]),
+            "creature_id": _pick(rec, ["creatureId", "creature_id"]),
+            "entity_id": _pick(rec, ["entityId", "entity_id"]) or str(meta.get("entityId") or "") or SANDBOX_ENTITY,
+        }
+        _SANDBOX_CACHE[space_id] = (route, now + _SANDBOX_TTL)
+        return route
+    # 2) Fallback: the space's members (older attach paths / non-platform tools).
     for m in _read_members(space_id):
         if m["program_id"] and m["program_id"] == self_pid:
             continue  # skip ourselves
