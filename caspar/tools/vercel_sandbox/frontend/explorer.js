@@ -353,7 +353,10 @@ function renderChrome() {
 
   if (W.status != null) {
     if (S.loading) {
-      W.status.set('text', 'Loading…');
+      // The very first open of a space boots a fresh cloud sandbox, which can
+      // take up to a minute; deeper navigation is fast. Set expectations at the
+      // root so a long first load doesn't read as "stuck".
+      W.status.set('text', S.parts.length === 0 ? 'Starting sandbox… (first open can take a minute)' : 'Loading…');
       W.status.set('color', T.muted);
     } else if (S.error != null) {
       W.status.set('text', '⚠ ' + S.error);
