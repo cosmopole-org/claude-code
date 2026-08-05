@@ -51,6 +51,26 @@ def _lp(s: str) -> bytes:
     return struct.pack(">I", len(b)) + b
 
 
+def _normalize_pem(key: str) -> str:
+    """Coerce a private key into a real PEM the parser accepts.
+
+    A PEM stored as a JSON string or a CI secret is often single-line with
+    literal ``\\n`` escapes (and sometimes wrapping quotes) rather than real
+    newlines — feeding that straight to ``RSA.import_key`` fails with
+    "Not a valid PEM pre boundary". Restore the line boundaries here so the
+    env-injected operator key (``CASPAR_OPERATOR_PRIVATE_KEY``) works whether it
+    was pasted with real or escaped newlines. Already-valid PEMs are unchanged
+    (a base64 body never contains a backslash)."""
+    if not key:
+        return key
+    k = key.strip()
+    if len(k) >= 2 and k[0] == k[-1] and k[0] in ("'", '"'):
+        k = k[1:-1].strip()
+    # Turn escaped newlines (\r\n, \n) into real ones; no-op for real PEMs.
+    k = k.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n")
+    return k if k.endswith("\n") else k + "\n"
+
+
 def sign_payload(priv_pem: str, payload_bytes: bytes) -> str:
     """RSA-PSS SHA256 signature, base64 — matches the node's verifier."""
     if not _HAVE_CRYPTO:
@@ -154,7 +174,7 @@ class CasparSignalingClient:
         if not user_id or not private_key:
             raise ValueError("authenticate requires both a user_id and a private_key")
         self.user_id = user_id
-        self.priv_pem = private_key
+        self.priv_pem = _normalize_pem(private_key)
 
     def create_machine_creature(self, name: str, metadata: Optional[Dict[str, Any]] = None) -> str:
         r = self.send("/creatures/create", {"type": "machine", "username": name[:32],
