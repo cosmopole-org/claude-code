@@ -18,7 +18,15 @@ could influence, and are never written to the repo.
 
 Environment
 -----------
-    CASPAR_NODE_HOST / CASPAR_NODE_PORT / CASPAR_CA_BUNDLE / CASPAR_DEPLOY_USER
+    CASPAR_NODE_HOST / CASPAR_NODE_PORT / CASPAR_CA_BUNDLE
+
+    Deploy operator (shared with the agent backbone + every other tool, so a
+    redeploy owns the program it minted and never mints a fresh one — see
+    caspar_deploy_common.resolve_operator):
+      CASPAR_DEPLOY_IDENTITY_FILE   persisted operator identity (default: next to
+                                    CASPAR_MANIFEST)
+      CASPAR_OPERATOR_ID / CASPAR_OPERATOR_PRIVATE_KEY   inject it explicitly
+      CASPAR_DEPLOY_USER            first-login username only (default davinci_admin)
 
     SANDBOX_REUSE_PROGRAM_ID  redeploy onto this existing program id instead of
                               minting a new creature — what CI passes on every run
@@ -49,7 +57,6 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
 from caspar_deploy_common import (  # noqa: E402
-    DEPLOY_USER,
     NODE_HOST,
     NODE_PORT,
     apply_ca,
@@ -62,6 +69,7 @@ from caspar_deploy_common import (  # noqa: E402
     env_any,
     info,
     ok,
+    resolve_operator,
     stamp_context,
     truthy,
     vm_label,
@@ -173,8 +181,9 @@ def main() -> int:
 
     info(f"connecting to Caspar node {NODE_HOST}:{NODE_PORT}")
     client = CasparSignalingClient(NODE_HOST, NODE_PORT, timeout=180).connect()
-    client.login(DEPLOY_USER)
-    ok(f"logged in as {DEPLOY_USER} (user_id={client.user_id})")
+    # Authenticate as the ONE durable deploy operator, so this redeploy owns the
+    # sandbox program it minted before and never has to mint a fresh one.
+    resolve_operator(client)
 
     import os
 

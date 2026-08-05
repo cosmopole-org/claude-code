@@ -143,6 +143,19 @@ class CasparSignalingClient:
         self.priv_pem = r["privateKey"]
         return r
 
+    def authenticate(self, user_id: str, private_key: str) -> None:
+        """Act as an already-known identity without a fresh ``/creatures/login``.
+
+        Every request is signed with ``private_key`` and stamped with ``user_id``;
+        the node verifies that against the creature's stored public key, exactly as
+        it does after a login. This lets every deploy reuse the *same* persisted
+        operator account run after run, so a redeploy always owns the creatures and
+        programs it minted and never has to re-mint them."""
+        if not user_id or not private_key:
+            raise ValueError("authenticate requires both a user_id and a private_key")
+        self.user_id = user_id
+        self.priv_pem = private_key
+
     def create_machine_creature(self, name: str, metadata: Optional[Dict[str, Any]] = None) -> str:
         r = self.send("/creatures/create", {"type": "machine", "username": name[:32],
                                             "publicKey": "", "metadata": metadata or {}})
