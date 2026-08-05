@@ -36,6 +36,33 @@
  * creatures the backend did not already send. See `catalog.mergeCatalogs`.
  */
 
+/**
+ * Every id that identifies the *calling* agent, so discovery never lists the agent
+ * to itself. An agent is a proxy entity in the space, so its own program shows up
+ * in the program index like any other; handing it back as an employable "tool"
+ * makes the model call itself — and invoking an agent proxy over the tool protocol
+ * never yields a `tools/result`, so the run hangs until the tool timeout. The
+ * backend's `catalogForSpace` avoids this with `excludeProgramId`; we mirror it
+ * with every id spelling the signal carries for "me": the proxy program the signal
+ * was sent to, this agent's resource id (`self.id`), and the backbone's own ids.
+ */
+function selfIds(task, bridge) {
+  const out = new Set();
+  const add = (v) => {
+    if (typeof v === "string" && v.trim()) out.add(v.trim());
+  };
+  add(task?.proxyProgramId);
+  add(task?.proxy_program_id);
+  add(task?.self?.id);
+  add(task?.self?.resourceId);
+  add(task?.resourceId);
+  add(task?.agentId);
+  add(task?.targetAgentId);
+  add(bridge?.programId);
+  add(bridge?.machineId);
+  return out;
+}
+
 /** Resolve the space (Caspar store) id for this task, or "" when there is none. */
 export function resolveSpaceId(task) {
   const direct = task?.spaceId || task?.storeId || task?.space_id || task?.store_id;
@@ -204,6 +231,7 @@ export function entryFromProgram(rec, spaceId) {
   if (!routing.programId && !routing.creatureId) return null;
   const meta = rec && typeof rec.metadata === "object" && rec.metadata ? rec.metadata : {};
   if (!routing.entityId) routing.entityId = pick(meta, ["entityId", "entity_id"]);
+  const resourceId = pick(rec, ["resourceId", "resource_id"]) || pick(meta, ["resourceId", "resource_id"]);
   const d = descriptorFromProgram(rec);
   let entry;
   if (d && d.kind) {
@@ -231,6 +259,7 @@ export function entryFromProgram(rec, spaceId) {
   const defaults = meta.defaults && typeof meta.defaults === "object" ? { ...meta.defaults } : {};
   if (spaceId && !defaults.space_id && !defaults.spaceId) defaults.space_id = spaceId;
   entry.defaults = defaults;
+  if (resourceId) entry.resource_id = resourceId;
   return entry;
 }
 
@@ -281,12 +310,16 @@ export async function discoverSpaceCatalog(bridge, task, opts = {}) {
   const timeoutMs = num(opts.timeoutMs, num(process.env.CLAUDE_CREATURE_DISCOVER_TIMEOUT_MS, 8000));
   const maxMembers = num(opts.maxMembers, num(process.env.CLAUDE_CREATURE_DISCOVER_MAX, 50));
 
-  const selfIds = new Set([bridge.programId, bridge.machineId].filter((s) => typeof s === "string" && s));
+  const mine = selfIds(task, bridge);
+  const isSelf = (e) =>
+    (e.program_id && mine.has(e.program_id)) ||
+    (e.creature_id && mine.has(e.creature_id)) ||
+    (e.resource_id && mine.has(e.resource_id));
   const byKey = new Map();
   const keyOf = (e) => `${e.creature_id || ""}|${e.program_id || ""}`;
   const add = (entry) => {
     if (!entry) return;
-    if ((entry.program_id && selfIds.has(entry.program_id)) || (entry.creature_id && selfIds.has(entry.creature_id))) return;
+    if (isSelf(entry)) return; // never hand the agent itself back as an employable tool
     if (byKey.size >= maxMembers) return;
     const key = keyOf(entry);
     if (byKey.has(key)) return; // first writer wins — the program index is authoritative
@@ -312,7 +345,7 @@ export async function discoverSpaceCatalog(bridge, task, opts = {}) {
       const key = `${m.creatureId}|${m.programId}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      if ((m.programId && selfIds.has(m.programId)) || (m.creatureId && selfIds.has(m.creatureId))) continue;
+      if ((m.programId && mine.has(m.programId)) || (m.creatureId && mine.has(m.creatureId))) continue;
       unique.push(m);
       if (unique.length >= maxMembers) break;
     }
