@@ -2,8 +2,8 @@
 """Deploy the github tool creature onto a running Caspar node.
 
 The github tool gives a Decillion space a full git + GitHub client: a member
-connects a GitHub account (OAuth device flow) and then people and agents in the
-space clone, branch, commit, push, pull, merge and open/merge pull requests. One
+connects a GitHub account (OAuth web application flow) and then people and agents
+in the space clone, branch, commit, push, pull, merge and open/merge PRs. One
 docker creature serves every space (per-space state is keyed by the space id), so
 it is deployed once and any space adds it from its tool-management page.
 
@@ -28,7 +28,8 @@ Environment
     GITHUB_VM_RAM_MB / _DISK_GB / _CPUS / _MAX_SECONDS   VM resources
     GITHUB_REBUILD_TIMEOUT    image build wait, seconds (default 600)
 
-    GITHUB_OAUTH_CLIENT_ID (required for a usable tool), GITHUB_OAUTH_CLIENT_SECRET,
+    GITHUB_OAUTH_CLIENT_ID, GITHUB_OAUTH_CLIENT_SECRET, GITHUB_OAUTH_REDIRECT_URI
+                              (all required for a usable web OAuth flow),
     GITHUB_OAUTH_SCOPES, GITHUB_API_BASE, GITHUB_WEB_BASE, GITHUB_*  → baked in
 
 Output (stdout, machine-readable — the CI greps these):
@@ -87,7 +88,8 @@ FRONTEND_SOURCE = TOOLS_DIR / TOOL_ID / "frontend" / "dashboard.js"
 # Every name the tool reads from its environment. Baked into the image so an
 # agent's prompt can never redirect the OAuth app or the API host.
 GITHUB_ENV_NAMES = (
-    "GITHUB_OAUTH_CLIENT_ID", "GITHUB_OAUTH_CLIENT_SECRET", "GITHUB_OAUTH_SCOPES",
+    "GITHUB_OAUTH_CLIENT_ID", "GITHUB_OAUTH_CLIENT_SECRET", "GITHUB_OAUTH_REDIRECT_URI",
+    "GITHUB_OAUTH_SCOPES", "GITHUB_OAUTH_STATE_TTL_S",
     "GITHUB_API_BASE", "GITHUB_WEB_BASE",
     "GITHUB_HTTP_TIMEOUT", "GITHUB_MAX_OUTPUT", "GITHUB_MAX_READ_BYTES",
     "GITHUB_GIT_TIMEOUT_S", "GITHUB_API_PAGE_CAP", "GITHUB_WORKSPACE",
@@ -100,6 +102,7 @@ GITHUB_ENV_NAMES = (
 _ALIASES = {
     "GH_OAUTH_CLIENT_ID": "GITHUB_OAUTH_CLIENT_ID",
     "GH_OAUTH_CLIENT_SECRET": "GITHUB_OAUTH_CLIENT_SECRET",
+    "GH_OAUTH_REDIRECT_URI": "GITHUB_OAUTH_REDIRECT_URI",
     "GH_OAUTH_SCOPES": "GITHUB_OAUTH_SCOPES",
 }
 
@@ -171,6 +174,15 @@ def compose_dockerfile(files: Dict[str, str]):
     baked = bake_env()
     if baked.get("GITHUB_OAUTH_CLIENT_ID"):
         info(f"baking GitHub OAuth app into the image (client_id={baked['GITHUB_OAUTH_CLIENT_ID'][:6]}…)")
+        # The web (authorization-code) flow needs the secret AND the callback URL;
+        # without either the connect flow fails at token exchange or authorize.
+        if not baked.get("GITHUB_OAUTH_CLIENT_SECRET"):
+            warn("no GITHUB_OAUTH_CLIENT_SECRET — the web OAuth flow cannot exchange the code for a "
+                 "token; set it (GH_OAUTH_CLIENT_SECRET in CI) or connecting will fail")
+        if not baked.get("GITHUB_OAUTH_REDIRECT_URI"):
+            warn("no GITHUB_OAUTH_REDIRECT_URI — set it to Nest's callback "
+                 "(…/api/github/oauth/callback) and register the same URL on the OAuth app, or "
+                 "connecting will fail")
     else:
         warn("no GITHUB_OAUTH_CLIENT_ID in the environment — the creature will deploy but the connect "
              "flow will fail until the OAuth app is baked in")
