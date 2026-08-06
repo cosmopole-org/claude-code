@@ -139,20 +139,29 @@ def _resolve_operator_key(raw_key: str, b64_key: str) -> str:
         c = (cand or "").strip()
         if _looks_like_pem(c):
             return c
-    # 2) Otherwise treat it as base64 (prefer the _B64 var). Strip whitespace and
-    #    re-pad so a wrapped or padding-stripped value still decodes.
+    # 2) Otherwise treat it as base64 (prefer the _B64 var). Strip whitespace,
+    #    accept the URL-safe alphabet (-/_ → +//), and re-pad, so a wrapped,
+    #    padding-stripped, or url-safe value still decodes. (Standard b64decode
+    #    silently DROPS -/_ chars, which is what produced the "number of data
+    #    characters cannot be 1 more than a multiple of 4" failure.)
     for cand in (b64_key, raw_key):
         compact = "".join((cand or "").split())
         if not compact:
             continue
-        try:
-            decoded = base64.b64decode(compact + "=" * (-len(compact) % 4)).decode("utf-8")
-        except Exception as exc:  # noqa: BLE001
-            warn(f"an operator key value ({len(compact)} base64 chars) could not be decoded: {exc}")
-            continue
-        if _looks_like_pem(decoded):
-            return decoded
-        warn("a base64 operator key decoded but is not a PEM private key — ignoring it")
+        standard = compact.replace("-", "+").replace("_", "/")
+        last_exc: Optional[Exception] = None
+        for variant in (standard, compact):
+            try:
+                decoded = base64.b64decode(variant + "=" * (-len(variant) % 4)).decode("utf-8")
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                continue
+            if _looks_like_pem(decoded):
+                return decoded
+        if last_exc is not None:
+            warn(f"an operator key value ({len(compact)} base64 chars) could not be decoded: {last_exc}")
+        else:
+            warn("a base64 operator key decoded but is not a PEM private key — ignoring it")
     return ""
 
 
