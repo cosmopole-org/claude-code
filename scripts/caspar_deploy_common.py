@@ -119,6 +119,43 @@ def _write_identity(path: Path, identity: Dict[str, Any]) -> None:
         warn(f"could not persist the deploy operator identity to {path}: {exc}")
 
 
+def _looks_like_pem(s: str) -> bool:
+    return "-----BEGIN" in s and "PRIVATE KEY" in s
+
+
+def _resolve_operator_key(raw_key: str, b64_key: str) -> str:
+    """Return a usable PEM from whatever the operator secret carries.
+
+    CI secrets get pasted in every shape, so accept them all rather than fail on
+    a formatting slip:
+      * a raw PEM (real or ``\\n``-escaped newlines) in either variable — used
+        as-is (authenticate() restores the line boundaries);
+      * base64 of the PEM (the recommended CASPAR_OPERATOR_PRIVATE_KEY_B64) —
+        decoded, tolerant of embedded whitespace and missing ``=`` padding.
+    Returns "" when neither yields a PEM."""
+    # 1) An already-PEM value wins — covers a PEM accidentally placed in the _B64
+    #    slot (a common cause of "cannot be 1 more than a multiple of 4").
+    for cand in (raw_key, b64_key):
+        c = (cand or "").strip()
+        if _looks_like_pem(c):
+            return c
+    # 2) Otherwise treat it as base64 (prefer the _B64 var). Strip whitespace and
+    #    re-pad so a wrapped or padding-stripped value still decodes.
+    for cand in (b64_key, raw_key):
+        compact = "".join((cand or "").split())
+        if not compact:
+            continue
+        try:
+            decoded = base64.b64decode(compact + "=" * (-len(compact) % 4)).decode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            warn(f"an operator key value ({len(compact)} base64 chars) could not be decoded: {exc}")
+            continue
+        if _looks_like_pem(decoded):
+            return decoded
+        warn("a base64 operator key decoded but is not a PEM private key — ignoring it")
+    return ""
+
+
 def resolve_operator(client) -> str:
     """Authenticate ``client`` as the ONE durable deploy operator; return its id.
 
@@ -135,30 +172,22 @@ def resolve_operator(client) -> str:
          so runs 2+ take path (2).
     """
     op_id = env_any("CASPAR_OPERATOR_ID", "CASPAR_OPERATOR_USER_ID")
-    op_key = os.environ.get("CASPAR_OPERATOR_PRIVATE_KEY", "")
-    # A base64-encoded key (CASPAR_OPERATOR_PRIVATE_KEY_B64) is the robust way to
-    # inject the PEM through CI: it is a single line with no newlines or quotes to
-    # mangle, so it survives the SSH/env forwarding that can silently truncate or
-    # empty a multi-line secret. Prefer it when the raw key is absent/empty.
-    op_key_b64 = os.environ.get("CASPAR_OPERATOR_PRIVATE_KEY_B64", "").strip()
-    if op_key_b64 and not op_key.strip():
-        try:
-            op_key = base64.b64decode(op_key_b64).decode("utf-8")
-        except Exception as exc:  # noqa: BLE001
-            warn(f"CASPAR_OPERATOR_PRIVATE_KEY_B64 is set but could not be base64-decoded: {exc}")
-    if op_id and op_key.strip():
-        client.authenticate(op_id, op_key)
+    op_key = _resolve_operator_key(
+        os.environ.get("CASPAR_OPERATOR_PRIVATE_KEY", ""),
+        os.environ.get("CASPAR_OPERATOR_PRIVATE_KEY_B64", ""),
+    )
+    if op_id and op_key:
+        client.authenticate(op_id, op_key)  # authenticate() normalizes PEM newlines
         ok(f"deploy operator from env: {op_id} (pinned; redeploys reuse this account and never re-mint)")
         return op_id
-    if op_id and not op_key.strip():
+    if op_id and not op_key:
         # A half-configured pin is the classic cause of "still re-minting despite
-        # pinning": the id is set, the key never arrived, so we fall back to the
-        # file/login path and drift. Make it LOUD instead of silent.
-        warn(f"CASPAR_OPERATOR_ID={op_id} is set but no usable private key was provided "
-             "(CASPAR_OPERATOR_PRIVATE_KEY empty/unusable and no CASPAR_OPERATOR_PRIVATE_KEY_B64). "
+        # pinning": the id is set, the key never arrived (or was unreadable), so we
+        # fall back to the file/login path and drift. Make it LOUD instead of silent.
+        warn(f"CASPAR_OPERATOR_ID={op_id} is set but no usable private key was provided. "
              "The pinned operator is NOT in effect — falling back to the persisted file / login, "
-             "which is what causes tool programs to re-mint. Set CASPAR_OPERATOR_PRIVATE_KEY_B64 to a "
-             "base64-encoded PEM (immune to newline mangling in CI) to fix this.")
+             "which is what causes tool programs to re-mint. Set CASPAR_OPERATOR_PRIVATE_KEY_B64 to the "
+             "base64 of the PEM (base64 -w0 < operator.pem); a raw or \\n-escaped PEM is also accepted.")
 
     path = _operator_identity_path()
     saved = _read_identity(path)
