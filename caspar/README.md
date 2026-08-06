@@ -1,5 +1,15 @@
 # Claude Code as a Caspar creature
 
+> [!IMPORTANT]
+> **Retired as the Decillion agent backbone.** The platform's backbone creature —
+> the program in the `davinci.agent` manifest slot — is now the **Grok Build
+> creature**, in the [`cosmopole-org/grok-build`](https://github.com/cosmopole-org/grok-build)
+> repo under `caspar/` (deployed by its `scripts/deploy_grok_creature.py`). The
+> per-space `vercel_sandbox` and the `github` platform tools moved with it, and
+> `decillionai-server/scripts/ci-deploy.sh` now clones grok-build as `AGENT_REPO`.
+> Nothing in this directory is deployed by Decillion CI any more; it is kept for
+> reference and for anyone who wants to run Claude Code as a creature directly.
+
 This directory turns Claude Code into a **Caspar `docker` creature program entity**
 — an autonomous agent the [Decillion](https://github.com/DecillionAI/decillionai-server)
 platform can prompt over Caspar's signaling API. It speaks the exact wire contract
