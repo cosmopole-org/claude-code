@@ -145,7 +145,14 @@ def _resolve_operator_key(raw_key: str, b64_key: str) -> str:
     #    silently DROPS -/_ chars, which is what produced the "number of data
     #    characters cannot be 1 more than a multiple of 4" failure.)
     for cand in (b64_key, raw_key):
-        compact = "".join((cand or "").split())
+        # '+' in a base64 value frequently arrives as a SPACE — form/URL handling
+        # in the secret → SSH → env chain turns '+' into ' ', and those spaces are
+        # then dropped, leaving a length that is "1 more than a multiple of 4" and
+        # undecodable. Recover them by mapping space→'+' BEFORE stripping the
+        # remaining (wrapping) whitespace. Clean single-line base64 has no spaces,
+        # so this is a no-op there.
+        recovered = (cand or "").replace(" ", "+")
+        compact = "".join(recovered.split())
         if not compact:
             continue
         standard = compact.replace("-", "+").replace("_", "/")
